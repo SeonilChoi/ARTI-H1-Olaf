@@ -816,9 +816,11 @@ class ArtiH1VelocityEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
         env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
-        # Episode_Reward/<term>: per-second average of each weighted term over the finished episodes (mjlab logging)
+        # Episode_Reward/<term>: per-second average of each weighted term over the finished episodes, divided by each
+        # episode's own duration (was max_episode_length_s, which under-reported episodes that ended early)
         if hasattr(self, "episode_sums"):
-            ep = {f"Episode_Reward/{k}": v[env_ids].mean() / self.max_episode_length_s for k, v in self.episode_sums.items()}
+            dur = (self.episode_length_buf[env_ids].float() * self.step_dt).clamp_min(self.step_dt)
+            ep = {f"Episode_Reward/{k}": (v[env_ids] / dur).mean() for k, v in self.episode_sums.items()}
             self.extras.setdefault("log", {}).update(ep)
             for v in self.episode_sums.values():
                 v[env_ids] = 0.0

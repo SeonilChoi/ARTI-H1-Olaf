@@ -460,6 +460,7 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         cfg, d = self.cfg, self.robot.data
         dt = self.step_dt
         n_sub = max(self.substeps, 1)
+        impact = self.impact_acc * (cfg.impact_reference_dt / float(cfg.sim.dt))  # 240 Hz-equivalent sum
         tau_sq = self.tau_sq_acc / n_sub
         # thermal model (eq. 6), explicit Euler at the control rate
         self.temp_rate = -self.th_alpha * (self.temp - self.temp_amb) + self.th_beta * tau_sq
@@ -499,7 +500,7 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
             "joint_limits_lower": -cfg.w_joint_limits * torch.sum(torch.clamp(qd + gq * (q - self.q_min), max=0.0).abs(), -1),
             "joint_limits_upper": -cfg.w_joint_limits * torch.sum(torch.clamp(-qd + gq * (self.q_max - q), max=0.0).abs(), -1),
             "foot_collision": -cfg.w_foot_collision * self._foot_collision(),
-            "impact": -cfg.w_impact * torch.sum(self.impact_acc, -1),
+            "impact": -cfg.w_impact * torch.sum(impact, -1),
         }
         reward = sum(terms.values()) * dt
         for k, v in terms.items():
@@ -514,7 +515,8 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
             "Olaf/temp_max_C": self.temp.max(dim=-1).values.mean(),
             "Olaf/temp_over_max_frac": (self.temp > cfg.thermal_max).float().mean(),
             "Olaf/tau_rms": torch.sqrt(tau_sq.mean()),
-            "Olaf/impact_dv_rms_cm_s": torch.sqrt(self.impact_acc.sum(-1) / n_sub).mean(),
+            # rms per 240 Hz step (comparable across physics rates)
+            "Olaf/impact_dv_rms_cm_s": torch.sqrt(impact.sum(-1) * cfg.impact_reference_dt / dt).mean(),
             "Olaf/foot_collision_frac": self._foot_collision().mean(),
             "Olaf/path_torso_dist_cm": 100.0 * (self.path[:, :2] - pos[:, :2]).norm(dim=-1).mean(),
         }

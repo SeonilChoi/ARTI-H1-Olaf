@@ -20,6 +20,7 @@ ap.add_argument("--num_envs", type=int, default=32)
 ap.add_argument("--steps", type=int, default=1500)
 ap.add_argument("--ideal", action="store_true", help="noiseless, undelayed IMU (checks the filter / frames)")
 ap.add_argument("--no_push", action="store_true")
+ap.add_argument("--impact_scale", type=float, default=-1.0, help="fixed accelerometer touchdown-noise scale")
 AppLauncher.add_app_launcher_args(ap)
 a, _ = ap.parse_known_args()
 app = AppLauncher(a)
@@ -40,6 +41,8 @@ if a.ideal:
     cfg.dr_start_accel_bias, cfg.dr_start_gyro_noise, cfg.dr_start_gyro_bias = (0.0, 0.0), 0.0, (0.0, 0.0)
     cfg.mti3_gyro_noise_std_rad_s, cfg.mti3_gyro_bias_range_rad_s, cfg.imu_gyro_extra_delay_steps = 0.0, (0.0, 0.0), 0
     cfg.mti3_gyro_bias_walk_std_rad_s, cfg.imu_latency_s = 0.0, 0.0
+if a.impact_scale >= 0.0:
+    cfg.accel_impact_scale_range = (a.impact_scale, a.impact_scale)
 if a.no_push:
     cfg.events.push_robot = None
 env = gym.make(a.task, cfg=cfg)
@@ -79,7 +82,7 @@ def rel(p, path):
 
 
 obs, _ = env.reset()
-stats = {k: [] for k in ("vel", "tilt", "yaw", "pos", "contact")}
+stats = {k: [] for k in ("vel", "tilt", "yaw", "pos", "contact", "w_true", "vz_est")}
 falls = 0
 yaw0 = None
 for t in range(a.steps):
@@ -105,12 +108,14 @@ for t in range(a.steps):
         stats["yaw"].append(torch.rad2deg(wrap(dyaw - yaw0)).abs()[ok])
         stats["pos"].append(100 * perr[ok])
         stats["contact"].append((u.ekf.contact == u.feet_contact)[ok].float().mean(-1))
+        stats["w_true"].append(u.robot.data.body_ang_vel_w.torch[:, u.ref_body_index][ok].norm(dim=-1))
+        stats["vz_est"].append(v_est[ok, 2].abs())
     if (t + 1) % int(round(5.0 / dt)) == 0 and stats["vel"]:
         m = {k: torch.cat(v).mean().item() for k, v in stats.items()}
         mx = {k: torch.cat(v).max().item() for k, v in stats.items()}
         print(f"t {(t + 1) * dt:5.1f} s | vel err {m['vel']:.3f} m/s (max {mx['vel']:.2f}) | tilt {m['tilt']:.2f} deg "
               f"(max {mx['tilt']:.1f}) | yaw drift {m['yaw']:.2f} deg | path-rel pos {m['pos']:.2f} cm "
-              f"(max {mx['pos']:.1f}) | contact agree {m['contact']:.3f} | falls {falls}", flush=True)
+              f"(max {mx['pos']:.1f}) | contact agree {m['contact']:.3f} | falls {falls} | true |w| {m['w_true']:.2f} rad/s | est |vz| {m['vz_est']:.3f} m/s", flush=True)
         stats = {k: [] for k in stats}
 env.close()
 app.app.close()

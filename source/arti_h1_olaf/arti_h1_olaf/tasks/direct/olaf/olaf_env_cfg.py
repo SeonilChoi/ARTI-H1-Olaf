@@ -152,6 +152,10 @@ class ArtiH1OlafEnvCfg(ArtiH1VelocityKBEnvCfg):
     # ~2.3 per step at weight 2.5e-3). dv_max 50 cm/s caps contact-resolution spikes (the paper's saturation).
     impact_velocity_scale = 100.0
     impact_dv_max = 50.0
+    # The sum over physics steps depends on the physics rate (a touchdown spreads over several steps, each with a smaller
+    # dv): at 600 Hz the same landing summed ~2.5-4x less than at the 240 Hz where the weight was set. The sum is scaled
+    # by impact_reference_dt / sim.dt, so the term keeps its 240 Hz strength.
+    impact_reference_dt = 1.0 / 240.0
 
     # --- foot-foot collision: sole rectangles (foot_sole_half_length / width) overlap in xy with |dz| < this ---
     foot_collision_margin = 0.005
