@@ -18,7 +18,9 @@ import anything from it.
 | Rewards (Tab. I) with weights (Tab. III) | All except the neck terms. The angular-velocity-xy weight is missing from Tab. III, so the z weight (1.5) is used |
 | Thermal model (eq. 6) + CBF reward (eq. 5c), `T_max` 80 °C, clip [70, 85] °C | Applied to the 12 leg actuators. α and β are fitted on the real logs (below). γ_T comes from the paper's feasibility rule (0.0108). Initial temperatures are spread up to 85 °C |
 | Joint-limit CBF (q_m 0.1 rad, γ_q 20), foot–foot collision, saturated impact reduction | Real motor limits. Collision is an oriented sole-rectangle overlap test. Impact: Δv_z between physics steps in cm/s, capped at 50 cm/s |
-| PPO, actor and critic 3×512, privileged critic, actor noise, pushes | `agents/skrl_olaf_ppo_cfg.yaml`. 4096 envs (paper 8192), 100k iterations |
+| PPO, actor and critic 3×512, privileged critic, actor noise, pushes | `agents/skrl_olaf_ppo_cfg.yaml`. 8192 envs on the server (local 4096 / 2048), 100k iterations |
+| Runtime (Sec. VII-C): policy 50 Hz, first-order hold to the 600 Hz actuator rate, 37.5 Hz low-pass | Sim at 600 Hz with decimation 12. Each physics step ramps linearly between the last two policy targets, applies the 5.24 rad/s slew limit and the 37.5 Hz low-pass (`_apply_action`). The controller runs the same chain in a 600 Hz servo thread |
+| State estimate: contact-aided invariant EKF on IMU + leg kinematics [42] | `olaf/inekf.py`, batched and run in the training loop for the actor. It uses the MTi-3 gyro, a simulated accelerometer (10 ms mean specific force, noise 0.3 m/s², bias ±0.2 m/s²) and the leg kinematics. The C++ twin is `robot::OlafInEKF`, which agrees to 1e-14 |
 
 Left out, because the robot does not have them: the battery model, the upper body (neck, arms, mouth, eyes, eyebrows,
 show functions) and the Animation Engine.
@@ -31,8 +33,9 @@ show functions) and the Animation Engine.
   identified from these logs. α is therefore fixed at 0.001 s⁻¹ (time constant about 17 min), T_amb is drawn from 20–31 °C
   (the observed session starts), and β is fitted per joint type.
 * Actuator delay, jitter and extra lag, Coulomb friction, armature, PD-gain DR, MTi-3 gyro noise, bias and delay, joint
-  zero errors, yaw torque bias, pushes, and the joint target filter (rate limit 5.24 rad/s, low-pass 0.6) are the KB
-  line's real2sim recipe (arti_h1_local `logs/rsi_kb`, kb05–kb13, from the 11-13..11-16 real logs).
+  zero errors, yaw torque bias, pushes and the 5.24 rad/s target rate limit are the KB line's real2sim recipe
+  (arti_h1_local `logs/rsi_kb`, kb05–kb13, from the 11-13..11-16 real logs). The KB line's per-step target low-pass
+  (0.6 at 60 Hz) is replaced by the paper's runtime chain above. The IMU delay stays one control step (now 20 ms).
 
 ## Commands
 
@@ -109,14 +112,17 @@ switches to walking and circle to standing.
 
 The controller builds the paper's state inputs itself:
 
-* **State estimate.** The torso pose and linear velocity relative to the path frame come from the IMU attitude plus
-  stance-foot kinematic odometry (`ArtiH1::olaf_estimate`). The paper uses an invariant EKF instead.
+* **State estimate.** The pelvis orientation, position and velocity come from the contact-aided invariant EKF
+  (`robot::OlafInEKF` in `ArtiH1::olaf_estimate`), as in the paper.
+* **Runtime chain.** The policy runs at 50 Hz. A 600 Hz servo thread applies the first-order hold, the slew limit and
+  the 37.5 Hz low-pass, then writes the motor commands.
 * **Path frame, clock and control input g.** These follow `ArtiH1OlafEnv`.
 * **Motor temperatures.** They are read from the bus.
 
-The env builds the actor's root pose and velocity with the same estimator (`actor_state_estimator`). A policy trained
-on ground truth fell 33 times per 16 envs per 5 s on the estimate. `scripts/check_estimator.py` runs a Python twin of
-the controller code against the env: the remaining difference is at the observation-noise level (1.1 cm, 0.04, 0.075 m/s).
+The env builds the actor's root pose, orientation and velocity with the same filter (`actor_state_estimator`); the
+critic and the rewards use the truth. `scripts/check_estimator.py` compares the filter with the truth in closed loop
+(`--ideal` = noiseless IMU). With zero actions while standing it converges to under 0.005 m/s and about 0.6° of tilt
+(the accelerometer bias and the tilt cannot be told apart when the robot is still).
 
 Export after training:
 

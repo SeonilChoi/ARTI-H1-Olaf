@@ -28,6 +28,7 @@ from isaaclab.utils.math import (
 from arti_h1_olaf.robots.arti_h1 import JOINT_EFFORT_LIMIT
 
 from ..base.arti_h1_velocity_env import ArtiH1VelocityEnv
+from .inekf import InEKF
 from .olaf_env_cfg import ArtiH1OlafEnvCfg
 
 
@@ -126,13 +127,32 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         self.impact_acc = torch.zeros(n, 2, device=dev)
         self.applied_target = self.robot.data.default_joint_pos.torch.clone()
 
-        # robot-side state estimate for the actor (humanoid_controller ArtiH1::olaf_estimate): IMU attitude + stance-foot
-        # kinematic odometry in an estimator frame, with its own path frame
+        # runtime chain (Sec. VII-C): policy target q_des at 50 Hz -> first-order hold between the last two targets over
+        # the control period -> slew limit -> first-order low-pass at action_lowpass_hz, every physics (actuator) step
+        self.q_des = self.robot.data.default_joint_pos.torch.clone()
+        self.q_des_prev = self.q_des.clone()
+        self.q_filt = self.q_des.clone()
+        sim_dt = float(cfg.sim.dt)
+        self.lp_alpha = 1.0 - math.exp(-2.0 * math.pi * cfg.action_lowpass_hz * sim_dt) if cfg.action_lowpass_hz > 0 else 1.0
+        self.slew = cfg.action_rate_limit * sim_dt if cfg.action_rate_limit > 0 else float("inf")
+
+        # robot-side state estimate for the actor (humanoid_controller robot::OlafInEKF): contact-aided invariant EKF on
+        # the MTi-3 gyro / accelerometer and the leg kinematics, in its own world frame, with its own path frame
+        self.ekf = InEKF(n, dev, gyro_noise=cfg.ekf_gyro_noise, accel_noise=cfg.ekf_accel_noise,
+                         gyro_bias_noise=cfg.ekf_gyro_bias_noise, accel_bias_noise=cfg.ekf_accel_bias_noise,
+                         contact_noise=cfg.ekf_contact_noise, fk_noise=cfg.ekf_fk_noise, init_std=dict(cfg.ekf_init_std))
+        self.imu_r = torch.tensor(cfg.imu_translation, device=dev, dtype=torch.float32)  # IMU in the pelvis frame
+        # IMU point velocity accel_average_s before the observation (the Xsens acceleration output is dV / dt over its
+        # output interval)
+        self.accel_avg_steps = min(cfg.decimation, max(1, int(round(cfg.accel_average_s / sim_dt))))
+        self.imu_vel_prev = torch.zeros(n, 3, device=dev)
+        self.accel_bias = torch.zeros(n, 3, device=dev)
+        self.accel_buf = torch.zeros(n, self.mti3_imu.delay_steps + 1, 3, device=dev)
+        self.accel_buf[..., 2] = 9.81
         self.est_init = torch.zeros(n, dtype=torch.bool, device=dev)
         self.est_pos = torch.zeros(n, 3, device=dev)
         self.est_vel = torch.zeros(n, 3, device=dev)
-        self.est_anchor = torch.zeros(n, 2, 3, device=dev)
-        self.est_contact = torch.ones(n, 2, dtype=torch.bool, device=dev)
+        self.est_R = torch.eye(3, device=dev).repeat(n, 1, 1)
         self.est_feet = torch.zeros(n, 2, 3, device=dev)
         self.est_feet_yaw = torch.zeros(n, 2, device=dev)
         self.est_root_yaw = torch.zeros(n, device=dev)
@@ -273,7 +293,10 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         path[:, 2] = yaw + torch.clamp(_wrap(path[:, 2] - yaw), -cfg.path_max_yaw, cfg.path_max_yaw)
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        super()._pre_physics_step(actions)  # actions, command resampling, PD target (scale, limits, filter, slew)
+        super()._pre_physics_step(actions)  # actions, command resampling, PD target (scale, real limits)
+        # the new policy target; the actuator-rate chain ramps from the previous one (_apply_action)
+        self.q_des_prev.copy_(self.q_des)
+        self.q_des.copy_(self.q_target)
         dt = self.step_dt
         pos, quat, _, _ = self._torso()
         if self.walk:
@@ -296,6 +319,12 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         self.substeps = 0
 
     def _apply_action(self):
+        # actuator-rate chain: first-order hold (linear between the last two policy targets), slew limit, low-pass
+        k = (self.substeps + 1) / self.cfg.decimation
+        u = self.q_des_prev + k * (self.q_des - self.q_des_prev) if self.cfg.action_first_order_hold else self.q_des
+        u = torch.clamp(u, self.q_filt - self.slew, self.q_filt + self.slew)
+        self.q_filt += self.lp_alpha * (u - self.q_filt)
+        self.q_target.copy_(self.q_filt)
         target = self.q_target.clone()
         if hasattr(self, "joint_obs_offset"):
             target = target - self.joint_obs_offset  # encoder-frame targets (homing zero error)
@@ -314,7 +343,29 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         dv2 = torch.square(vz - self.foot_vz_prev)
         self.impact_acc += torch.clamp(dv2, max=self.cfg.impact_dv_max ** 2)
         self.foot_vz_prev.copy_(vz)
+        if self.substeps == self.cfg.decimation - self.accel_avg_steps:
+            self.imu_vel_prev.copy_(self._imu_point_velocity())
         self.substeps += 1
+
+    def _imu_point_velocity(self) -> torch.Tensor:
+        d = self.robot.data
+        q = d.body_quat_w.torch[:, self.imu_body_index]
+        w = d.body_ang_vel_w.torch[:, self.imu_body_index]
+        r = quat_apply(q, self.imu_r.expand(self.num_envs, 3))
+        # body_lin_vel_w is the centre-of-mass velocity: the IMU point moves with the link frame origin
+        return d.body_link_lin_vel_w.torch[:, self.imu_body_index] + torch.cross(w, r, dim=-1)
+
+    def _read_accel(self) -> torch.Tensor:
+        """MTi-3 accelerometer: specific force at the IMU point (IMU = pelvis axes), mean over the last accel_average_s
+        (Xsens: dV / dt of the output interval), + per-episode bias + white noise, delayed like the MTi-3 orientation."""
+        d = self.robot.data
+        a_w = (self._imu_point_velocity() - self.imu_vel_prev) / (self.accel_avg_steps * float(self.cfg.sim.dt))
+        a_w[:, 2] += 9.81
+        f = quat_apply_inverse(d.body_quat_w.torch[:, self.imu_body_index], a_w)
+        f = f + self.accel_bias + self.cfg.accel_noise_std * torch.randn_like(f)
+        self.accel_buf = torch.roll(self.accel_buf, -1, dims=1)
+        self.accel_buf[:, -1] = f
+        return self.accel_buf[:, 0]
 
     # ------------------------------------------------------------------ helpers
     def _foot_collision(self) -> torch.Tensor:
@@ -336,42 +387,40 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         close_z = (feet[:, 1, 2] - feet[:, 0, 2]).abs() < self.cfg.foot_collision_max_dz
         return (~sep & close_z).float()
 
-    def _estimate(self, R: torch.Tensor):
-        """Twin of ArtiH1::olaf_estimate. R = IMU attitude (world_R_pelvis as the controller sees it)."""
-        cfg, d, n = self.cfg, self.robot.data, self.num_envs
+    def _estimate(self, R_imu: torch.Tensor, gyro_b: torch.Tensor):
+        """Twin of robot::OlafInEKF use in ArtiH1::olaf_estimate. R_imu = MTi-3 attitude (world_R_pelvis as the controller
+        sees it; only used to start the filter), gyro_b = MTi-3 gyro (pelvis frame, the same one the actor sees)."""
+        cfg, d = self.cfg, self.robot.data
+        accel_b = self._read_accel()
         pel_p = d.body_pos_w.torch[:, self.ref_body_index]
         Rp = matrix_from_quat(d.body_quat_w.torch[:, self.ref_body_index])
         sole_b = (Rp.transpose(1, 2)[:, None] @ (self._foot_positions() - pel_p[:, None])[..., None])[..., 0]  # FK
-        rel = (R[:, None] @ sole_b[..., None])[..., 0]
+        s = sole_b - self.imu_r  # soles relative to the IMU (the filter's body origin), pelvis axes
+        # (re)start over the first control steps of an episode: the MTi-3 model only reports the reset attitude after
+        # its delay line has refilled; the controller starts its filter after the IMU calibration, with the policy
+        new = ~self.est_init | (self.episode_length_buf <= 2)
+        ekf = self.ekf
+        # one batched filter step for every env; the restarting ones are overwritten by reset() below
+        ekf.propagate(gyro_b, accel_b, self.step_dt)
+        rel = (ekf.R.float()[:, None] @ s[..., None])[..., 0]
+        zmin = rel[..., 2].min(-1, keepdim=True).values
+        contact = rel[..., 2] - zmin < cfg.est_contact_tolerance
+        ekf.correct(s, contact)
+        if new.any():
+            ekf.reset(new, R_imu[new], s[new])
+        R = ekf.R.float()
+        w = gyro_b - ekf.bg.float()
+        self.est_R = R
+        self.est_pos = ekf.p.float() - (R @ self.imu_r[:, None])[..., 0]
+        self.est_vel = ekf.v.float() - (R @ torch.cross(w, self.imu_r.expand_as(w), dim=-1)[..., None])[..., 0]
+        self.est_feet = ekf.p.float()[:, None] + (R[:, None] @ s[..., None])[..., 0]
         R_feet = [R @ Rp.transpose(1, 2) @ matrix_from_quat(d.body_quat_w.torch[:, bi]) for bi in self.foot_body_indices]
         self.est_feet_yaw = torch.stack([torch.atan2(Rf[:, 1, 0], Rf[:, 0, 0]) for Rf in R_feet], -1)
         self.est_root_yaw = torch.atan2(R[:, 1, 0], R[:, 0, 0])
-        # (re)anchor over the first control steps of an episode: the MTi-3 model only reports the reset attitude after
-        # its delay line has refilled (step 0 read the previous episode's heading); the controller starts its estimator
-        # after the IMU calibration, with the policy
-        new = ~self.est_init | (self.episode_length_buf <= 2)
         if new.any():
-            self.est_pos[new] = 0.0
-            self.est_pos[new, 2] = -0.5 * (rel[new, 0, 2] + rel[new, 1, 2])
-            anc = self.est_pos[new, None] + rel[new]
-            anc[..., 2] = 0.0
-            self.est_anchor[new] = anc
-            self.est_contact[new] = True
-            self.est_vel[new] = 0.0
             self.est_path[new] = torch.stack((self.est_pos[new, 0], self.est_pos[new, 1], self.est_root_yaw[new]), -1)
             self.est_init[new] = True
-        zmin = rel[..., 2].min(-1, keepdim=True).values
-        contact = rel[..., 2] - zmin < cfg.est_contact_tolerance
-        anc = self.est_pos[:, None] + rel
-        anc[..., 2] = 0.0
-        self.est_anchor = torch.where((contact & ~self.est_contact)[..., None], anc, self.est_anchor)
-        self.est_contact = contact
-        p = ((self.est_anchor - rel) * contact[..., None]).sum(1) / contact.sum(-1, keepdim=True).clamp_min(1)
-        alpha = self.step_dt / (self.step_dt + cfg.est_velocity_tau)
-        self.est_vel = self.est_vel + alpha * ((p - self.est_pos) / self.step_dt - self.est_vel)
-        self.est_pos = p
-        self.est_feet = self.est_pos[:, None] + rel
-        del n
+        return R
 
     def _temp_obs(self, temp: torch.Tensor) -> torch.Tensor:
         lo, hi = self.cfg.thermal_clip
@@ -461,8 +510,7 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         lin_b = quat_apply_inverse(quat, lin_w)
         ang_b = quat_apply_inverse(quat, ang_w)
         if cfg.actor_state_estimator:
-            R = matrix_from_quat(quat_imu)
-            self._estimate(R)
+            R = self._estimate(matrix_from_quat(quat_imu), quat_apply_inverse(quat_imu, ang_vel_w_imu))
             e_psi = self.est_path[:, 2]
             act_p = torch.cat((_rot2(-e_psi, self.est_pos[:, :2] - self.est_path[:, :2]), self.est_pos[:, 2:3]), -1)
             c, s_ = torch.cos(e_psi), torch.sin(e_psi)
@@ -573,6 +621,12 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
             self.previous_actions2[env_ids] = act
         self.ref_q_prev[env_ids] = self.ref_q[env_ids]
         self.est_init[env_ids] = False
+        lo, hi = cfg.accel_bias_range
+        self.accel_bias[env_ids] = torch.empty(k, 3, device=dev).uniform_(lo, hi)
+        self.imu_vel_prev[env_ids] = self._imu_point_velocity()[env_ids]
+        self.q_des[env_ids] = self.q_target[env_ids]
+        self.q_des_prev[env_ids] = self.q_target[env_ids]
+        self.q_filt[env_ids] = self.q_target[env_ids]
         self.foot_vz_prev[env_ids] = 0.0
         self.impact_acc[env_ids] = 0.0
         self.tau_sq_acc[env_ids] = 0.0

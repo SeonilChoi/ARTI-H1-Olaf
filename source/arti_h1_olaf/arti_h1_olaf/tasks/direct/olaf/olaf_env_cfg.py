@@ -22,7 +22,12 @@ What differs (robot, not method)
   * thermal coefficients and every sim-to-real property come from the existing ARTI-H1 real logs: alpha / beta fitted
     on 28 robot logs (assets/thermal/arti_h1_thermal.json), actuator delay / friction / armature / gains / IMU / joint
     zero errors / yaw bias = the KB line's real2sim recipe (arti_h1_local logs/rsi_kb, kb05-kb13)
-  * control at 60 Hz (the deployed ARTI-H1 controller), not 50 Hz; 4096 envs on the 16 GB GPU instead of 8192
+  * 4096 envs on the 16 GB GPU instead of 8192 (local runs; the server runs 8192)
+
+Runtime (Sec. VII-C) as in the paper: policy at 50 Hz, its output upsampled to the 600 Hz actuator rate with a
+first-order hold and low-pass filtered at 37.5 Hz (sim: 600 Hz physics, decimation 12; the robot controller runs the
+same chain in a 600 Hz servo thread). The state s_t comes from a contact-aided invariant EKF fusing the IMU and the
+leg kinematics ([42], olaf/inekf.py), run in the training loop for the actor and on the robot.
 """
 
 from __future__ import annotations
@@ -62,6 +67,13 @@ class ArtiH1OlafEnvCfg(ArtiH1VelocityKBEnvCfg):
 
     mode = "walk"  # "walk" | "stand"
     episode_length_s = 20.0
+
+    # --- runtime (Sec. VII-C): 50 Hz policy, first-order hold to the 600 Hz actuator rate, 37.5 Hz low-pass ---
+    decimation = 12  # 600 Hz physics / 50 Hz policy
+    action_first_order_hold = True
+    action_lowpass_hz = 37.5
+    # joint target slew limit (rad/s) of the ARTI-H1 controller, applied at the actuator rate before the low-pass
+    action_rate_limit = 5.24
     observation_space = WALK_OBS
     state_space = WALK_OBS + _PRIV
     reference_file = REFERENCE_FILE
@@ -157,7 +169,19 @@ class ArtiH1OlafEnvCfg(ArtiH1VelocityKBEnvCfg):
     # A policy trained on the truth fell 33x / 16 envs / 5 s on the estimate (scripts/check_estimator.py).
     actor_state_estimator = True
     est_contact_tolerance = 0.012  # m: a sole this close to the lowest sole is in contact
-    est_velocity_tau = 0.03  # s: low-pass of the estimated pelvis velocity
+    # contact-aided invariant EKF ([42], olaf/inekf.py; C++ twin robot::OlafInEKF): continuous noise densities (/sqrt(Hz))
+    ekf_gyro_noise = 0.02  # rad/s
+    ekf_accel_noise = 0.5  # m/s^2 (stance-impact vibration on the real MTi-3)
+    ekf_gyro_bias_noise = 0.002
+    ekf_accel_bias_noise = 0.02
+    ekf_contact_noise = 0.05  # m/s, sole slip
+    ekf_fk_noise = 0.01  # m, leg kinematics (std)
+    ekf_init_std = {"rot": 0.03, "vel": 0.05, "pos": 0.01, "gyro_bias": 0.03, "accel_bias": 0.2}
+    # accelerometer model (sim): specific force at the IMU point + white noise + per-episode bias, same delay as the
+    # MTi-3 orientation
+    accel_average_s = 0.01  # s, MTi-3 output interval (~100 Hz)
+    accel_noise_std = 0.3  # m/s^2
+    accel_bias_range = (-0.2, 0.2)  # m/s^2
 
     # --- reference state initialisation (walking: random phase of the commanded clip) ---
     reset_reference_state = True
@@ -171,8 +195,10 @@ class ArtiH1OlafEnvCfg(ArtiH1VelocityKBEnvCfg):
     # --- terminations (Sec. V-C): torso / upper body on the ground -> inherited trunk-height + tilt check ---
 
     # --- real2sim (KB line, arti_h1_local logs/rsi_kb kb05-kb13, real logs 11-13..11-16) ---
-    target_rate_limit = 5.24
-    target_lowpass_alpha = 0.6
+    # the KB line's per-control-step target low-pass (0.6) / slew limit are replaced by the paper's runtime chain above
+    target_rate_limit = 0.0
+    target_lowpass_alpha = 1.0
+    imu_latency_s = 0.02  # one control step (the KB line: one 60 Hz step)
     mti3_gyro_noise_std_rad_s = 0.04
     mti3_gyro_bias_range_rad_s = (-0.03, 0.03)
     actuator_delay_step_jitter = 1
@@ -190,6 +216,8 @@ class ArtiH1OlafEnvCfg(ArtiH1VelocityKBEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+        self.sim.dt = 1.0 / 600.0
+        self.sim.render_interval = self.decimation
         self.events.actuator_gains.params["stiffness_distribution_params"] = (0.85, 1.3)
         self.events.actuator_gains.params["damping_distribution_params"] = (0.5, 1.2)
         self.events.push_robot.params["velocity_range"]["x"] = (-0.5, 0.5)
