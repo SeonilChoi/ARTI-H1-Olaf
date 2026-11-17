@@ -227,7 +227,10 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         quat = quat_mul(_yaw_quat(psi), r[:, 29:33])
         v = torch.cat((_rot2(psi, r[:, 33:35]), r[:, 35:36]), dim=-1)
         w = torch.cat((_rot2(psi, r[:, 36:38]), r[:, 38:39]), dim=-1)
-        return r[:, 0:12], r[:, 12:24], r[:, 24:26], pos, quat, v, w
+        # contact flags: the phase interpolation and the KNN blend make them fractional; the reward compares them with the
+        # 0/1 sole contact by equality, so binarise (a fractional flag never matched: ~22% of the contact reward was lost)
+        contact = (r[:, 24:26] > 0.5).float()
+        return r[:, 0:12], r[:, 12:24], contact, pos, quat, v, w
 
     def _compute_reference(self, env_ids: torch.Tensor | None = None):
         """x_t = f(p_PF, g, phi) (eq. 2), resolved in the world: torso pose / velocity, joints, contacts."""
