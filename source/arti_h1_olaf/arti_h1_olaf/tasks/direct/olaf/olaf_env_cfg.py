@@ -151,8 +151,13 @@ class ArtiH1OlafEnvCfg(ArtiH1VelocityKBEnvCfg):
     noise_lin_vel = 0.05
     noise_joint_pos = 0.01
     noise_joint_vel = 0.3
-    # root pose / velocity w.r.t. the path frame come from a state estimator on the robot (paper [42]); the sim gives
-    # the truth plus the noise above. The gyro is the MTi-3 model (bias / delay / noise).
+    # root pose / velocity w.r.t. the path frame come from a state estimator on the robot (paper [42]). True: the actor
+    # sees the robot controller's estimate (humanoid_controller ArtiH1::olaf_estimate, IMU attitude + stance-foot
+    # kinematic odometry, its own path frame), plus the noise above; the critic and the rewards keep the truth.
+    # A policy trained on the truth fell 33x / 16 envs / 5 s on the estimate (scripts/check_estimator.py).
+    actor_state_estimator = True
+    est_contact_tolerance = 0.012  # m: a sole this close to the lowest sole is in contact
+    est_velocity_tau = 0.03  # s: low-pass of the estimated pelvis velocity
 
     # --- reference state initialisation (walking: random phase of the commanded clip) ---
     reset_reference_state = True

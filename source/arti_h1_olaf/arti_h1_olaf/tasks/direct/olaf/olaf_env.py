@@ -126,6 +126,18 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         self.impact_acc = torch.zeros(n, 2, device=dev)
         self.applied_target = self.robot.data.default_joint_pos.torch.clone()
 
+        # robot-side state estimate for the actor (humanoid_controller ArtiH1::olaf_estimate): IMU attitude + stance-foot
+        # kinematic odometry in an estimator frame, with its own path frame
+        self.est_init = torch.zeros(n, dtype=torch.bool, device=dev)
+        self.est_pos = torch.zeros(n, 3, device=dev)
+        self.est_vel = torch.zeros(n, 3, device=dev)
+        self.est_anchor = torch.zeros(n, 2, 3, device=dev)
+        self.est_contact = torch.ones(n, 2, dtype=torch.bool, device=dev)
+        self.est_feet = torch.zeros(n, 2, 3, device=dev)
+        self.est_feet_yaw = torch.zeros(n, 2, device=dev)
+        self.est_root_yaw = torch.zeros(n, device=dev)
+        self.est_path = torch.zeros(n, 3, device=dev)
+
         # joint limits for the CBF terms (the sim's hard limits = real motor limits, hip_roll +-15 deg)
         self.q_min = self._joint_pos_lower + cfg.joint_limit_margin
         self.q_max = self._joint_pos_upper - cfg.joint_limit_margin
@@ -243,29 +255,42 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         psi = torch.atan2(torch.sin(yl) + torch.sin(yr), torch.cos(yl) + torch.cos(yr))
         return 0.5 * (feet[:, 0, :2] + feet[:, 1, :2]), psi
 
+    def _step_path(self, path, pos_xy, yaw, mid, psi_f):
+        """One control step of the path frame (in place): walking integrates g, standing converges to the feet
+        midpoint / heading; then it is kept within path_max_distance / path_max_yaw of the torso (Sec. V)."""
+        dt, cfg = self.step_dt, self.cfg
+        if self.walk:
+            psi = path[:, 2].clone()
+            path[:, :2] += _rot2(psi, self.g[:, :2]) * dt
+            path[:, 2] = psi + self.g[:, 2] * dt
+        else:
+            a = 1.0 - math.exp(-dt / cfg.stand_path_tau_s)
+            path[:, :2] += a * (mid - path[:, :2])
+            path[:, 2] += a * _wrap(psi_f - path[:, 2])
+        e = path[:, :2] - pos_xy
+        dist = e.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        path[:, :2] = pos_xy + e * torch.clamp(cfg.path_max_distance / dist, max=1.0)
+        path[:, 2] = yaw + torch.clamp(_wrap(path[:, 2] - yaw), -cfg.path_max_yaw, cfg.path_max_yaw)
+
     def _pre_physics_step(self, actions: torch.Tensor):
         super()._pre_physics_step(actions)  # actions, command resampling, PD target (scale, limits, filter, slew)
-        dt, cfg = self.step_dt, self.cfg
+        dt = self.step_dt
         pos, quat, _, _ = self._torso()
         if self.walk:
             self.phase = (self.phase + dt / self.walk_period) % 1.0
-            psi = self.path[:, 2]
-            self.path[:, :2] += _rot2(psi, self.g[:, :2]) * dt
-            self.path[:, 2] = psi + self.g[:, 2] * dt
+            mid, psi_f = None, None
         else:
             step = self.stand_rate * dt
             self.ref_q_prev.copy_(self.ref_q)
             self.g += torch.clamp(self.g_target - self.g, -step, step)
             mid, psi_f = self._feet_frame()
-            a = 1.0 - math.exp(-dt / cfg.stand_path_tau_s)
-            self.path[:, :2] += a * (mid - self.path[:, :2])
-            self.path[:, 2] += a * _wrap(psi_f - self.path[:, 2])
-        # keep the path frame within a bounded distance of the torso (Sec. V)
-        e = self.path[:, :2] - pos[:, :2]
-        dist = e.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        self.path[:, :2] = pos[:, :2] + e * torch.clamp(cfg.path_max_distance / dist, max=1.0)
-        yaw = _yaw_of(quat)
-        self.path[:, 2] = yaw + torch.clamp(_wrap(self.path[:, 2] - yaw), -cfg.path_max_yaw, cfg.path_max_yaw)
+        self._step_path(self.path, pos[:, :2], _yaw_of(quat), mid, psi_f)
+        if self.cfg.actor_state_estimator:
+            # the robot-side path frame, integrated in the estimator frame from the last estimate (controller order)
+            e_mid = self.est_feet[:, :, :2].mean(1)
+            yl, yr = self.est_feet_yaw[:, 0], self.est_feet_yaw[:, 1] + math.pi
+            e_psi = torch.atan2(torch.sin(yl) + torch.sin(yr), torch.cos(yl) + torch.cos(yr))
+            self._step_path(self.est_path, self.est_pos[:, :2], self.est_root_yaw, e_mid, e_psi)
         self.tau_sq_acc.zero_()
         self.impact_acc.zero_()
         self.substeps = 0
@@ -310,6 +335,43 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
             sep |= (c * ax).sum(-1).abs() > r0 + r1
         close_z = (feet[:, 1, 2] - feet[:, 0, 2]).abs() < self.cfg.foot_collision_max_dz
         return (~sep & close_z).float()
+
+    def _estimate(self, R: torch.Tensor):
+        """Twin of ArtiH1::olaf_estimate. R = IMU attitude (world_R_pelvis as the controller sees it)."""
+        cfg, d, n = self.cfg, self.robot.data, self.num_envs
+        pel_p = d.body_pos_w.torch[:, self.ref_body_index]
+        Rp = matrix_from_quat(d.body_quat_w.torch[:, self.ref_body_index])
+        sole_b = (Rp.transpose(1, 2)[:, None] @ (self._foot_positions() - pel_p[:, None])[..., None])[..., 0]  # FK
+        rel = (R[:, None] @ sole_b[..., None])[..., 0]
+        R_feet = [R @ Rp.transpose(1, 2) @ matrix_from_quat(d.body_quat_w.torch[:, bi]) for bi in self.foot_body_indices]
+        self.est_feet_yaw = torch.stack([torch.atan2(Rf[:, 1, 0], Rf[:, 0, 0]) for Rf in R_feet], -1)
+        self.est_root_yaw = torch.atan2(R[:, 1, 0], R[:, 0, 0])
+        # (re)anchor over the first control steps of an episode: the MTi-3 model only reports the reset attitude after
+        # its delay line has refilled (step 0 read the previous episode's heading); the controller starts its estimator
+        # after the IMU calibration, with the policy
+        new = ~self.est_init | (self.episode_length_buf <= 2)
+        if new.any():
+            self.est_pos[new] = 0.0
+            self.est_pos[new, 2] = -0.5 * (rel[new, 0, 2] + rel[new, 1, 2])
+            anc = self.est_pos[new, None] + rel[new]
+            anc[..., 2] = 0.0
+            self.est_anchor[new] = anc
+            self.est_contact[new] = True
+            self.est_vel[new] = 0.0
+            self.est_path[new] = torch.stack((self.est_pos[new, 0], self.est_pos[new, 1], self.est_root_yaw[new]), -1)
+            self.est_init[new] = True
+        zmin = rel[..., 2].min(-1, keepdim=True).values
+        contact = rel[..., 2] - zmin < cfg.est_contact_tolerance
+        anc = self.est_pos[:, None] + rel
+        anc[..., 2] = 0.0
+        self.est_anchor = torch.where((contact & ~self.est_contact)[..., None], anc, self.est_anchor)
+        self.est_contact = contact
+        p = ((self.est_anchor - rel) * contact[..., None]).sum(1) / contact.sum(-1, keepdim=True).clamp_min(1)
+        alpha = self.step_dt / (self.step_dt + cfg.est_velocity_tau)
+        self.est_vel = self.est_vel + alpha * ((p - self.est_pos) / self.step_dt - self.est_vel)
+        self.est_pos = p
+        self.est_feet = self.est_pos[:, None] + rel
+        del n
 
     def _temp_obs(self, temp: torch.Tensor) -> torch.Tensor:
         lo, hi = self.cfg.thermal_clip
@@ -398,6 +460,18 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         gyro_b = quat_apply_inverse(quat_imu, ang_vel_w_imu)
         lin_b = quat_apply_inverse(quat, lin_w)
         ang_b = quat_apply_inverse(quat, ang_w)
+        if cfg.actor_state_estimator:
+            R = matrix_from_quat(quat_imu)
+            self._estimate(R)
+            e_psi = self.est_path[:, 2]
+            act_p = torch.cat((_rot2(-e_psi, self.est_pos[:, :2] - self.est_path[:, :2]), self.est_pos[:, 2:3]), -1)
+            c, s_ = torch.cos(e_psi), torch.sin(e_psi)
+            Rz = torch.zeros(n, 3, 3, device=dev)
+            Rz[:, 0, 0], Rz[:, 0, 1], Rz[:, 1, 0], Rz[:, 1, 1], Rz[:, 2, 2] = c, s_, -s_, c, 1.0
+            act_rot = (Rz @ R)[..., :2].reshape(n, 6)
+            act_v = (R.transpose(1, 2) @ self.est_vel[..., None])[..., 0]
+        else:
+            act_p, act_rot, act_v = p_rel, rot6(rel_imu), lin_b
         joint_pos, joint_vel = self._stale_joint_feedback()
         a1 = torch.clamp(self.actions, -1.0, 1.0)
         a2 = torch.clamp(self.previous_actions, -1.0, 1.0)
@@ -410,7 +484,7 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
             return x + s * torch.randn_like(x)
 
         policy = torch.cat((
-            nz(p_rel, cfg.noise_root_pos), nz(rot6(rel_imu), cfg.noise_root_rot), nz(lin_b, cfg.noise_lin_vel), gyro_b,
+            nz(act_p, cfg.noise_root_pos), nz(act_rot, cfg.noise_root_rot), nz(act_v, cfg.noise_lin_vel), gyro_b,
             P(nz(joint_pos - self.default_q, cfg.noise_joint_pos)), P(nz(joint_vel, cfg.noise_joint_vel)), P(a1), P(a2),
             P(self._temp_obs(temp_seen)), *tail), dim=-1)
         height = self._feet_height_obs
@@ -498,6 +572,7 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
             self.previous_actions[env_ids] = act
             self.previous_actions2[env_ids] = act
         self.ref_q_prev[env_ids] = self.ref_q[env_ids]
+        self.est_init[env_ids] = False
         self.foot_vz_prev[env_ids] = 0.0
         self.impact_acc[env_ids] = 0.0
         self.tau_sq_acc[env_ids] = 0.0
