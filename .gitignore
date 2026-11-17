@@ -85,3 +85,5 @@ logs/
 reference/clips/
 **/__pycache__/
 *.egg-info/
+!source/arti_h1_olaf/arti_h1_olaf/assets/models/arti_h1/arti_h1/**/*.usd
+!source/arti_h1_olaf/arti_h1_olaf/assets/models/arti_h1/arti_h1/*.usd
