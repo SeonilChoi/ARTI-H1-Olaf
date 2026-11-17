@@ -50,7 +50,10 @@ if [ "$ONLY" != "stand" ]; then
     tmux send-keys -t "$SESSION:walk" "$(train_cmd Arti-H1-Olaf-Walk-v0 "$NW" olaf_walk "${WALK_CKPT:-}")" C-m
 fi
 if [ "$ONLY" != "walk" ]; then
-    [ "$ONLY" != "stand" ] && sleep 60  # let the first Kit instance finish starting
+    if [ "$ONLY" != "stand" ]; then
+        echo "walk started in tmux '$SESSION' (tmux attach -t $SESSION to watch); waiting 60 s before starting stand ..."
+        sleep 60  # let the first Kit instance finish starting
+    fi
     tmux new-window -t "$SESSION" -n stand
     tmux send-keys -t "$SESSION:stand" "$(train_cmd Arti-H1-Olaf-Stand-v0 "$NS" olaf_stand "${STAND_CKPT:-}")" C-m
 fi
