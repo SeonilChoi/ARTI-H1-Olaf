@@ -147,6 +147,12 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         self.accel_avg_steps = min(cfg.decimation, max(1, int(round(cfg.accel_average_s / sim_dt))))
         self.imu_vel_prev = torch.zeros(n, 3, device=dev)
         self.accel_bias = torch.zeros(n, 3, device=dev)
+        self.accel_base = torch.tensor(cfg.accel_base_noise, device=dev)
+        self.accel_impact = torch.tensor(cfg.accel_impact_noise, device=dev)
+        self.accel_impact_scale = torch.zeros(n, 1, device=dev)
+        self.accel_contact_prev = torch.ones(n, 2, dtype=torch.bool, device=dev)
+        self._dr_imu_final = (cfg.mti3_gyro_noise_std_rad_s, tuple(cfg.mti3_gyro_bias_range_rad_s),
+                              tuple(cfg.accel_impact_scale_range), tuple(cfg.accel_bias_range))
         self.accel_buf = torch.zeros(n, self.mti3_imu.delay_steps + 1, 3, device=dev)
         self.accel_buf[..., 2] = 9.81
         self.est_init = torch.zeros(n, dtype=torch.bool, device=dev)
@@ -347,6 +353,25 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
             self.imu_vel_prev.copy_(self._imu_point_velocity())
         self.substeps += 1
 
+    def _update_dr_widen(self):
+        """Base DR widening + the IMU terms (MTi-3 gyro noise / bias, accelerometer impact scale / bias), lerped from the
+        dr_start_* values to the final cfg values at the same levels. The MTi-3 model and the resets read these cfg fields."""
+        before = getattr(self, "_dr_level", -1)
+        super()._update_dr_widen()
+        level = getattr(self, "_dr_level", -1)
+        if level == before or not hasattr(self, "_dr_imu_final"):
+            return
+        cfg = self.cfg
+        fq = level / (max(2, int(cfg.dr_widen_levels)) - 1)
+        L = lambda a, b: self._dr_lerp(a, b, fq)
+        g_noise, g_bias, a_scale, a_bias = self._dr_imu_final
+        cfg.mti3_gyro_noise_std_rad_s = L(cfg.dr_start_gyro_noise, g_noise)
+        cfg.mti3_gyro_bias_range_rad_s = L(cfg.dr_start_gyro_bias, g_bias)
+        cfg.accel_impact_scale_range = L(cfg.dr_start_accel_impact_scale, a_scale)
+        cfg.accel_bias_range = L(cfg.dr_start_accel_bias, a_bias)
+        print(f"[DR] widen level {level}: gyro noise {cfg.mti3_gyro_noise_std_rad_s:.3f} bias {cfg.mti3_gyro_bias_range_rad_s}, "
+              f"accel impact scale {cfg.accel_impact_scale_range} bias {cfg.accel_bias_range}", flush=True)
+
     def _imu_point_velocity(self) -> torch.Tensor:
         d = self.robot.data
         q = d.body_quat_w.torch[:, self.imu_body_index]
@@ -362,7 +387,11 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         a_w = (self._imu_point_velocity() - self.imu_vel_prev) / (self.accel_avg_steps * float(self.cfg.sim.dt))
         a_w[:, 2] += 9.81
         f = quat_apply_inverse(d.body_quat_w.torch[:, self.imu_body_index], a_w)
-        f = f + self.accel_bias + self.cfg.accel_noise_std * torch.randn_like(f)
+        # touchdown on this control step (true sole contact, as the env's contact reward) -> impact noise
+        td = (self.feet_contact & ~self.accel_contact_prev).any(-1, keepdim=True).float()
+        self.accel_contact_prev.copy_(self.feet_contact)
+        std = self.accel_base + td * self.accel_impact_scale * self.accel_impact
+        f = f + self.accel_bias + std * torch.randn_like(f)
         self.accel_buf = torch.roll(self.accel_buf, -1, dims=1)
         self.accel_buf[:, -1] = f
         return self.accel_buf[:, 0]
@@ -623,6 +652,9 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         self.est_init[env_ids] = False
         lo, hi = cfg.accel_bias_range
         self.accel_bias[env_ids] = torch.empty(k, 3, device=dev).uniform_(lo, hi)
+        lo, hi = cfg.accel_impact_scale_range
+        self.accel_impact_scale[env_ids] = torch.empty(k, 1, device=dev).uniform_(lo, hi)
+        self.accel_contact_prev[env_ids] = True
         self.imu_vel_prev[env_ids] = self._imu_point_velocity()[env_ids]
         self.q_des[env_ids] = self.q_target[env_ids]
         self.q_des_prev[env_ids] = self.q_target[env_ids]

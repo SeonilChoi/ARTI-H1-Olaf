@@ -170,18 +170,30 @@ class ArtiH1OlafEnvCfg(ArtiH1VelocityKBEnvCfg):
     actor_state_estimator = True
     est_contact_tolerance = 0.012  # m: a sole this close to the lowest sole is in contact
     # contact-aided invariant EKF ([42], olaf/inekf.py; C++ twin robot::OlafInEKF): continuous noise densities (/sqrt(Hz))
+    # Chosen on the real KB logs (scripts/real2sim/inekf_real_logs.py, 7 logs 11-13..11-16, offline filter with FK from
+    # the logged joints): accel 2.0 / contact 0.05 / fk 0.004 gave the smallest tilt gap to the MTi-3 (1.86 deg), the
+    # smallest vertical-velocity jitter and plausible biases (|b_a| 0.04 m/s^2, |b_g| 0.022 rad/s); walking vx 0.010 m/s
+    # vs commanded 0.007 m/s.
     ekf_gyro_noise = 0.02  # rad/s
-    ekf_accel_noise = 0.5  # m/s^2 (stance-impact vibration on the real MTi-3)
+    ekf_accel_noise = 2.0  # m/s^2 (touchdown impacts on the real MTi-3)
     ekf_gyro_bias_noise = 0.002
     ekf_accel_bias_noise = 0.02
     ekf_contact_noise = 0.05  # m/s, sole slip
-    ekf_fk_noise = 0.01  # m, leg kinematics (std)
+    ekf_fk_noise = 0.004  # m, leg kinematics (std)
     ekf_init_std = {"rot": 0.03, "vel": 0.05, "pos": 0.01, "gyro_bias": 0.03, "accel_bias": 0.2}
-    # accelerometer model (sim): specific force at the IMU point + white noise + per-episode bias, same delay as the
-    # MTi-3 orientation
+    # accelerometer model (sim), from the real logs (scripts/real2sim/accel_real_logs.py): specific force at the IMU point
+    # (mean over the MTi-3 output interval) + white noise + touchdown impact noise + per-episode bias, delayed like the
+    # MTi-3 orientation.
+    #  * still / standing under a policy, high-pass (> ~12 Hz) std 0.005-0.02 (sensor) / 0.02-0.09 m/s^2 -> base noise
+    #  * KB walking: high-pass std (1.0, 1.45, 4.0) m/s^2 and p99 | |a| - g | 15 m/s^2 against (0.54, 0.85, 1.72) and 7.9
+    #    in sim (60 Hz walking policy): the missing part is touchdown impacts. Added as noise on the control steps with a
+    #    touchdown (~5 % of walking steps): std = sqrt(real^2 - sim^2) / sqrt(0.05), scaled per episode
+    #  * offline InEKF on the real logs: accelerometer bias components up to 0.14 m/s^2
     accel_average_s = 0.01  # s, MTi-3 output interval (~100 Hz)
-    accel_noise_std = 0.3  # m/s^2
-    accel_bias_range = (-0.2, 0.2)  # m/s^2
+    accel_base_noise = (0.03, 0.03, 0.08)  # m/s^2, x y z
+    accel_impact_noise = (3.8, 5.2, 16.0)  # m/s^2 on a touchdown step
+    accel_impact_scale_range = (0.25, 1.0)  # per episode (the Olaf impact reward lands softer than the KB line)
+    accel_bias_range = (-0.15, 0.15)  # m/s^2
 
     # --- reference state initialisation (walking: random phase of the commanded clip) ---
     reset_reference_state = True
@@ -209,7 +221,17 @@ class ArtiH1OlafEnvCfg(ArtiH1VelocityKBEnvCfg):
     actuator_delay_ms = {"hip_yaw": 4.0, "hip_roll": 4.0, "hip_pitch": 4.0, "knee": 4.0, "ankle_pitch": 3.0, "ankle_roll": 3.0}
     actuator_delay_jitter_ms = (-6.0, 6.0)
     actuator_delay_extra_ms = {"hip_roll": 25.0, "ankle_pitch": 12.0}
-    actuator_delay_extra_curriculum_steps = (0, 0)
+    # --- domain randomisation grows gradually (base env DR widening): from the dr_start_* ranges (near the measured
+    # robot) to the final ranges above, in dr_widen_levels steps between dr_widen_steps (env steps; 24 per iteration:
+    # iteration 1k -> 50k of 100k). Covers friction, pelvis mass / CoM, PD gains, pushes, actuator delay jitter, Coulomb,
+    # armature, joint zero errors, yaw torque bias, the extra actuator lag, and (OlafEnv) the IMU gyro / accelerometer.
+    dr_widen_steps = (24_000, 1_200_000)
+    dr_widen_levels = 10
+    actuator_delay_extra_curriculum_steps = (24_000, 1_200_000)
+    dr_start_gyro_noise = 0.01  # rad/s (KB run33: the real MTi-3 standing)
+    dr_start_gyro_bias = (-0.01, 0.01)
+    dr_start_accel_impact_scale = (0.0, 0.25)
+    dr_start_accel_bias = (-0.03, 0.03)
     actuator_coulomb_scale_range = (0.3, 1.2)
     actuator_armature_scale_range = (0.5, 1.3)
     yaw_torque_bias_range = (-0.8, 0.8)
@@ -262,6 +284,9 @@ class ArtiH1OlafWalkEnvCfg_PLAY(ArtiH1OlafWalkEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 16
+        # play / evaluation: the final (widest) randomisation, no curriculum
+        self.dr_widen_steps = (0, 0)
+        self.actuator_delay_extra_curriculum_steps = (0, 0)
 
 
 @configclass
@@ -269,4 +294,7 @@ class ArtiH1OlafStandEnvCfg_PLAY(ArtiH1OlafStandEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 16
+        # play / evaluation: the final (widest) randomisation, no curriculum
+        self.dr_widen_steps = (0, 0)
+        self.actuator_delay_extra_curriculum_steps = (0, 0)
 

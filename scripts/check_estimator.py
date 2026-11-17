@@ -36,7 +36,8 @@ cfg = resolve_task_config(a.task, None, overrides=["physics=isaacsim_physx"])[0]
 cfg.scene.num_envs = a.num_envs
 cfg.episode_length_s = 1e4
 if a.ideal:
-    cfg.accel_noise_std, cfg.accel_bias_range = 0.0, (0.0, 0.0)
+    cfg.accel_base_noise, cfg.accel_impact_noise, cfg.accel_bias_range = (0.0,) * 3, (0.0,) * 3, (0.0, 0.0)
+    cfg.dr_start_accel_bias, cfg.dr_start_gyro_noise, cfg.dr_start_gyro_bias = (0.0, 0.0), 0.0, (0.0, 0.0)
     cfg.mti3_gyro_noise_std_rad_s, cfg.mti3_gyro_bias_range_rad_s, cfg.imu_gyro_extra_delay_steps = 0.0, (0.0, 0.0), 0
     cfg.mti3_gyro_bias_walk_std_rad_s, cfg.imu_latency_s = 0.0, 0.0
 if a.no_push:

@@ -159,6 +159,7 @@ class InEKF:
     def correct(self, s: torch.Tensor, contact: torch.Tensor):
         """Soles s (body frame, (n, 2, 3)) and their contact flags. New contacts are augmented, the others measured."""
         s = s.to(torch.float64)
+        self.nis = torch.full((self.n, 2), float("nan"), dtype=torch.float64, device=self.dev)  # diagnostics
         new = contact & ~self.contact
         if new.any():
             idx = torch.arange(self.n, device=self.dev)
@@ -176,7 +177,9 @@ class InEKF:
             Z = (self.R @ s[:, i][..., None])[..., 0] + self.p - self.d[:, i]
             PHt = self.P @ H.transpose(1, 2)
             S = H @ PHt + self.fk_var * torch.eye(3, dtype=torch.float64, device=self.dev)
-            K = PHt @ torch.linalg.inv(S)
+            Sinv = torch.linalg.inv(S)
+            self.nis[:, i] = torch.where(m, (Z[:, None] @ Sinv @ Z[..., None])[:, 0, 0], torch.full_like(Z[:, 0], float("nan")))
+            K = PHt @ Sinv
             K = K * m[:, None, None]
             delta = (K @ Z[..., None])[..., 0]
             self._apply(delta)
