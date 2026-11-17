@@ -177,6 +177,16 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
             r += w[:, None] * self.stand_root_quat[ii[0], ii[1], ii[2], ii[3]]
         return q, p, r / r.norm(dim=-1, keepdim=True)
 
+    @staticmethod
+    def _resolve_walk(r: torch.Tensor, path: torch.Tensor, z0: torch.Tensor):
+        """Walk reference rows (path-frame relative) -> joints, contacts, world torso pose / velocity."""
+        psi = path[:, 2]
+        pos = torch.cat((path[:, :2] + _rot2(psi, r[:, 26:28]), (r[:, 28] + z0)[:, None]), dim=-1)
+        quat = quat_mul(_yaw_quat(psi), r[:, 29:33])
+        v = torch.cat((_rot2(psi, r[:, 33:35]), r[:, 35:36]), dim=-1)
+        w = torch.cat((_rot2(psi, r[:, 36:38]), r[:, 38:39]), dim=-1)
+        return r[:, 0:12], r[:, 12:24], r[:, 24:26], pos, quat, v, w
+
     def _compute_reference(self, env_ids: torch.Tensor | None = None):
         """x_t = f(p_PF, g, phi) (eq. 2), resolved in the world: torso pose / velocity, joints, contacts."""
         ids = slice(None) if env_ids is None else env_ids
@@ -184,12 +194,7 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         psi = path[:, 2]
         z0 = self.scene.env_origins[ids, 2]
         if self.walk:
-            r = self._walk_rows(g, self.phase[ids])
-            q, qd, contact = r[:, 0:12], r[:, 12:24], r[:, 24:26]
-            pos = torch.cat((path[:, :2] + _rot2(psi, r[:, 26:28]), (r[:, 28] + z0)[:, None]), dim=-1)
-            quat = quat_mul(_yaw_quat(psi), r[:, 29:33])
-            v = torch.cat((_rot2(psi, r[:, 33:35]), r[:, 35:36]), dim=-1)
-            w = torch.cat((_rot2(psi, r[:, 36:38]), r[:, 38:39]), dim=-1)
+            q, qd, contact, pos, quat, v, w = self._resolve_walk(self._walk_rows(g, self.phase[ids]), path, z0)
         else:
             q, p, rq = self._stand_lookup(g)
             qd = (q - self.ref_q_prev[ids]) / self.step_dt if env_ids is None else torch.zeros_like(q)
@@ -440,8 +445,13 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
             (d.root_pos_w.torch[env_ids], d.root_quat_w.torch[env_ids]), -1)
         self.path[env_ids, :2] = self.scene.env_origins[env_ids, :2]
         self.path[env_ids, 2] = _yaw_of(root[:, 3:7])
+        # Policy switches at runtime (paper Sec. VII-C, Animation Engine): part of the walking episodes start from the
+        # standing stance at walk_start_phase (stand -> walk), part of the standing episodes start mid-stride from a
+        # walking reference state (walk -> stand). The rest start from the own reference state (RSI).
+        switch = torch.rand(k, device=dev) < (cfg.reset_stand_pose_fraction if self.walk else cfg.reset_walk_pose_fraction)
         if self.walk:
             self.phase[env_ids] = torch.rand(k, device=dev) if cfg.reset_reference_state else 0.0
+            self.phase[env_ids[switch]] = cfg.walk_start_phase
         else:
             self.g[env_ids] = self.g_target[env_ids] if cfg.reset_reference_state else 0.0
         self._compute_reference(env_ids)
@@ -449,8 +459,31 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
             # reference state initialisation: torso pose / velocity and joints of x_t
             pose = torch.cat((self.ref_pos[env_ids], self.ref_quat[env_ids]), -1)
             vel = torch.cat((self.ref_v[env_ids], self.ref_w[env_ids]), -1)
-            q = torch.clamp(self.ref_q[env_ids], self._joint_pos_lower[env_ids], self._joint_pos_upper[env_ids])
-            qd = self.ref_qd[env_ids]
+            q = self.ref_q[env_ids].clone()
+            qd = self.ref_qd[env_ids].clone()
+            if switch.any():
+                s_ids = env_ids[switch]
+                if self.walk:
+                    # standing stance (default pose, the base reset's root pose), at rest
+                    root = d.default_root_pose.torch[s_ids].clone()
+                    root[:, :2] = self.scene.env_origins[s_ids, :2]
+                    root[:, 2] += self.scene.env_origins[s_ids, 2]
+                    root[:, 3:7] = quat_mul(_yaw_quat(self.path[s_ids, 2]), root[:, 3:7])
+                    pose[switch] = root
+                    vel[switch] = 0.0
+                    q[switch] = self.default_q[s_ids]
+                    qd[switch] = 0.0
+                else:
+                    # mid-stride walking reference state (random phase, random walking input)
+                    gw = self.walk_lo + torch.rand(len(s_ids), 3, device=dev) * (self.walk_hi - self.walk_lo)
+                    idx, w = self._walk_blend(gw)
+                    gw = (w[..., None] * self.walk_keys[idx]).sum(1)
+                    rows = self._walk_rows(gw, torch.rand(len(s_ids), device=dev))
+                    wq, wqd, _, wpos, wquat, wv, ww = self._resolve_walk(rows, self.path[s_ids], self.scene.env_origins[s_ids, 2])
+                    pose[switch] = torch.cat((wpos, wquat), -1)
+                    vel[switch] = torch.cat((wv, ww), -1)
+                    q[switch], qd[switch] = wq, wqd
+            q = torch.clamp(q, self._joint_pos_lower[env_ids], self._joint_pos_upper[env_ids])
             self.robot.write_root_link_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
             self.robot.write_root_com_velocity_to_sim_index(root_velocity=vel, env_ids=env_ids)
             self.robot.write_joint_position_to_sim_index(position=q, env_ids=env_ids)

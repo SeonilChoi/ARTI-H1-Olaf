@@ -156,6 +156,12 @@ class ArtiH1OlafEnvCfg(ArtiH1VelocityKBEnvCfg):
 
     # --- reference state initialisation (walking: random phase of the commanded clip) ---
     reset_reference_state = True
+    # policy switches (Sec. VII-C): walking episodes that start from the standing stance at walk_start_phase (the
+    # double support before the right foot lifts, phase 0 = left single support start), standing episodes that start
+    # from a mid-stride walking reference state. The robot controller starts the walking clock at walk_start_phase too.
+    reset_stand_pose_fraction = 0.2
+    reset_walk_pose_fraction = 0.3
+    walk_start_phase = 0.92
 
     # --- terminations (Sec. V-C): torso / upper body on the ground -> inherited trunk-height + tilt check ---
 
