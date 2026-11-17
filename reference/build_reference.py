@@ -5,7 +5,9 @@ averaged over the cycles. A clip's path frame is the centred one-period moving a
 path that the pelvis sways around); everything is stored relative to it, so the env can rebuild the full kinematic
 target x_t = f(p_PF, g, phi) from its own integrated path frame (paper eq. 1-2):
     q (12) / qd (12)               joint position / velocity, env joint order (JOINTS)
-    contact (2)                    left / right reference foot contact
+    contact (2)                    left / right reference foot contact: lowest sole corner below CONTACT_HEIGHT (the env's
+                                   own test, foot_contact_height) from reference/sole_heights.py; PlaCo support phase only
+                                   if a clip has no _sole.npz
     off (3)                        pelvis x, y offset in the path frame, pelvis z (world, ground = 0)
     quat (4)                       pelvis orientation relative to the path frame (x, y, z, w)
     v (3) / w (3)                  pelvis linear / angular velocity in the path frame
@@ -27,6 +29,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 JOINTS = [f"{s}_{j}" for s in ("left", "right") for j in ("hip_yaw", "hip_roll", "hip_pitch", "knee", "ankle_pitch", "ankle_roll")]
+CONTACT_HEIGHT = 0.008  # m, ArtiH1VelocityEnvCfg.foot_contact_height
 LAYOUT = {"q": (0, 12), "qd": (12, 24), "contact": (24, 26), "off": (26, 29), "quat": (29, 33), "v": (33, 36), "w": (36, 39)}
 
 
@@ -53,6 +56,7 @@ def build_clip(path):
     yaw = np.unwrap(rot.as_euler("ZYX")[:, 0])
     period = float(d["period"])
     n = int(round(period * fps))
+    clip_path = path
     path = moving_average(np.concatenate([p[:, :2], yaw[:, None]], 1), n)
     # finite differences (central) at fps
     dt = 1.0 / fps
@@ -67,7 +71,9 @@ def build_clip(path):
     q_rel = (R.from_euler("Z", psi[:, None]).inv() * rot).as_quat()
     v_p = np.concatenate([rot2(-psi, v_w[:, :2]), v_w[:, 2:]], 1)
     w_p = np.concatenate([rot2(-psi, w_w[:, :2]), w_w[:, 2:]], 1)
-    rows = np.concatenate([q, qd, d["contact"], off_xy, p[:, 2:3], q_rel, v_p, w_p], 1)
+    sole_file = clip_path[:-4] + "_sole.npz"
+    contact = np.load(sole_file)["sole_low"] if os.path.exists(sole_file) else None
+    rows = np.concatenate([q, qd, d["contact"] if contact is None else contact, off_xy, p[:, 2:3], q_rel, v_p, w_p], 1)
     # periodic part, away from the moving-average edges
     valid = d["periodic_valid"] > 0.5
     valid[: np.argmax(valid) + n] = False
@@ -78,9 +84,16 @@ def build_clip(path):
     for k in range(n):
         m = valid & (b == k)
         if not m.any():
-            raise RuntimeError(f"{path}: phase bin {k} empty")
+            raise RuntimeError(f"{clip_path}: phase bin {k} empty")
         table[k] = rows[m].mean(0)
-    table[:, 24:26] = (table[:, 24:26] > 0.5).astype(float)
+    if contact is None:
+        table[:, 24:26] = (table[:, 24:26] > 0.5).astype(float)
+    else:  # phase-binned lowest sole-corner height -> contact flag
+        support = np.zeros((n, 2))
+        for k in range(n):
+            support[k] = d["contact"][valid & (b == k)].mean(0)
+        build_clip.agree.append(((table[:, 24:26] < CONTACT_HEIGHT) == (support > 0.5)).mean())
+        table[:, 24:26] = (table[:, 24:26] < CONTACT_HEIGHT).astype(float)
     qn = table[:, 29:33]
     table[:, 29:33] = qn / np.linalg.norm(qn, axis=1, keepdims=True)
     T = valid.sum() * dt
@@ -93,13 +106,17 @@ def build_clip(path):
     return key, table, period, d["step"]
 
 
+build_clip.agree = []
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--walk", required=True)
     p.add_argument("--stand", required=True)
     p.add_argument("--out", required=True)
     a = p.parse_args()
-    files = sorted(glob.glob(os.path.join(a.walk, "[0-9]*.npz")), key=lambda f: int(os.path.basename(f)[:-4]))
+    files = sorted((f for f in glob.glob(os.path.join(a.walk, "[0-9]*.npz")) if not f.endswith("_sole.npz")),
+                   key=lambda f: int(os.path.basename(f)[:-4]))
     keys, tables, periods, steps = [], [], [], []
     for f in files:
         k, t, per, st = build_clip(f)
@@ -129,6 +146,9 @@ def main():
     print(f"  max |qd| per joint {np.abs(tables[:, :, 12:24]).max((0, 1)).round(1)}")
     print(f"  pelvis z {tables[:, :, 28].min():.4f}..{tables[:, :, 28].max():.4f}, |off xy| max "
           f"{np.abs(tables[:, :, 26:28]).max():.4f}")
+    if build_clip.agree:
+        print(f"  contact from sole heights (< {CONTACT_HEIGHT * 1000:.0f} mm) in {len(build_clip.agree)} clips; agreement with "
+              f"the PlaCo support phase {np.mean(build_clip.agree):.3f}, stance fraction {tables[:, :, 24:26].mean():.3f}")
     print(f"stand: grid {s['q'].shape[:-1]} -> {a.out}")
 
 
