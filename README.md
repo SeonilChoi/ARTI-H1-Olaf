@@ -94,11 +94,30 @@ python scripts/skrl/play.py --task Arti-H1-Olaf-Walk-Play-v0 --checkpoint <run>/
     --num_envs 4 --video --video_length 600 physics=isaacsim_physx
 ```
 
-## Deployment notes (not done yet)
+## Deployment (humanoid_controller branch `arti-h1-olaf`)
 
-The policy needs inputs that `humanoid_controller` does not produce today:
+`robot_olaf.yaml` (`policy.observation: olaf`) runs both policies. The robot starts standing; on the pad, cross
+switches to walking and circle to standing.
 
-* the torso pose and linear velocity relative to the path frame. The paper uses a state estimator that fuses the IMU
-  and the actuators (invariant EKF, its ref. [42]).
-* the path-frame integration.
-* the motor temperatures, which are already on the bus (`temp_*` columns in the logs).
+The controller builds the paper's state inputs itself:
+
+* **State estimate.** The torso pose and linear velocity relative to the path frame come from the IMU attitude plus
+  stance-foot kinematic odometry (`ArtiH1::olaf_estimate`). The paper uses an invariant EKF instead.
+* **Path frame, clock and control input g.** These follow `ArtiH1OlafEnv`.
+* **Motor temperatures.** They are read from the bus.
+
+The env builds the actor's root pose and velocity with the same estimator (`actor_state_estimator`). A policy trained
+on ground truth fell 33 times per 16 envs per 5 s on the estimate. `scripts/check_estimator.py` runs a Python twin of
+the controller code against the env: the remaining difference is at the observation-noise level (1.1 cm, 0.04, 0.075 m/s).
+
+Export after training:
+
+```bash
+python scripts/export_onnx.py --checkpoint logs/skrl/olaf_walk/<run>/checkpoints/agent_N.pt \
+    --out <humanoid_controller>/config/robot/ARTI-H1/agent_olaf_walk.onnx \
+    --keys_out <humanoid_controller>/config/robot/ARTI-H1/olaf_walk_keys.yaml
+python scripts/export_onnx.py --checkpoint logs/skrl/olaf_stand/<run>/checkpoints/agent_N.pt \
+    --out <humanoid_controller>/config/robot/ARTI-H1/agent_olaf_stand.onnx
+```
+
+The script checks that the ONNX output matches the torch policy.
