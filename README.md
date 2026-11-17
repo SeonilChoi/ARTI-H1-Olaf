@@ -82,6 +82,14 @@ python scripts/skrl/train.py --task Arti-H1-Olaf-Stand-v0 physics=isaacsim_physx
 # resume: add --checkpoint logs/skrl/olaf_walk/<run>/checkpoints/agent_N.pt
 ```
 
+Or all of it in one tmux session `olaf` (windows tensorboard / walk / stand; installs the package if needed):
+
+```bash
+cd /opt/isaac/projects/arti_h1_olaf && git pull
+bash scripts/server_tmux.sh               # 8192 envs each; e.g. "bash scripts/server_tmux.sh 4096 4096" on one GPU
+tmux attach -t olaf                       # Ctrl+b n = next window, Ctrl+b d = detach
+```
+
 Runs land in `logs/skrl/olaf_walk|olaf_stand/<date>_ppo_torch/` (checkpoint every 1000 iterations). TensorBoard:
 `tensorboard --logdir logs/skrl --port 6006`. Watch `Olaf/joint_err_deg`, `Olaf/torso_ori_err_deg`,
 `Olaf/torso_pos_err_cm`, `Olaf/contact_match`, `Olaf/temp_over_max_frac`, `Episode / Total timesteps (mean)` (max 1199
