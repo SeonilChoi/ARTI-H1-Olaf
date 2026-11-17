@@ -61,7 +61,7 @@ server needs neither PlaCo nor the real logs.
 ```bash
 # once
 cd /opt/isaac/projects
-git clone https://github.com/SeonilChoi/ARTI-H1_Olaf.git arti_h1_olaf
+git clone https://github.com/SeonilChoi/ARTI-H1-Olaf.git arti_h1_olaf
 source /opt/isaac/IsaacLab-main/.venv/bin/activate
 cd arti_h1_olaf
 uv pip install --no-deps -e source/arti_h1_olaf   # or: python -m pip install --no-deps -e source/arti_h1_olaf
