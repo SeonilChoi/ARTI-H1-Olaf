@@ -80,14 +80,15 @@ class InEKF:
     # ------------------------------------------------------------------ reset
     def reset(self, mask: torch.Tensor, R0: torch.Tensor, s: torch.Tensor, ground_z: float = 0.0):
         """Start the filter at attitude R0 (body -> world), zero velocity / biases, the body origin above the soles s
-        (body frame, (k, 2, 3)) with their mean height at ground_z, x / y = 0, both soles in contact."""
+        (body frame, (k, 2, 3)) with the lowest sole at ground_z (the other one may be in the air: mid-stride starts),
+        x / y = 0. Both soles are augmented; the next correct() measures only the ones in contact."""
         if not mask.any():
             return
         R0 = R0.to(torch.float64)
         s = s.to(torch.float64)
         rel = R0[:, None] @ s[..., None]
         p = torch.zeros(R0.shape[0], 3, dtype=torch.float64, device=self.dev)
-        p[:, 2] = ground_z - rel[:, :, 2, 0].mean(1)
+        p[:, 2] = ground_z - rel[:, :, 2, 0].min(1).values
         self.R[mask], self.v[mask], self.p[mask] = R0, 0.0, p
         self.bg[mask], self.ba[mask] = 0.0, 0.0
         self.P[mask] = self.P0

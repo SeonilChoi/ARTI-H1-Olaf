@@ -127,6 +127,7 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         self.tau_sq_acc = torch.zeros(n, 12, device=dev)
         self.substeps = 0
         self.foot_vz_prev = torch.zeros(n, 2, device=dev)
+        self.impact_skip = torch.ones(n, dtype=torch.bool, device=dev)
         self.impact_acc = torch.zeros(n, 2, device=dev)
         self.applied_target = self.robot.data.default_joint_pos.torch.clone()
 
@@ -279,7 +280,9 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
     def _torso(self):
         d = self.robot.data
         b = self.ref_body_index
-        return d.body_pos_w.torch[:, b], d.body_quat_w.torch[:, b], d.body_lin_vel_w.torch[:, b], d.body_ang_vel_w.torch[:, b]
+        # link-origin velocity (body_lin_vel_w is the centre of mass, 0.37 m above the pelvis link origin): the reference
+        # torso velocity, the estimator and the RSI writes are all about the link origin
+        return d.body_pos_w.torch[:, b], d.body_quat_w.torch[:, b], d.body_link_lin_vel_w.torch[:, b], d.body_ang_vel_w.torch[:, b]
 
     def _feet_frame(self):
         """Midpoint between the soles and their mean heading (right foot link faces -x: its yaw + pi)."""
@@ -357,7 +360,8 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         self.tau_sq_acc += tau * tau
         # impact reduction: change of the foot vertical velocity since the previous physics step, saturated
         vz = self._foot_velocities()[..., 2] * self.cfg.impact_velocity_scale
-        dv2 = torch.square(vz - self.foot_vz_prev)
+        dv2 = torch.square(vz - self.foot_vz_prev) * (~self.impact_skip)[:, None]
+        self.impact_skip.zero_()
         self.impact_acc += torch.clamp(dv2, max=self.cfg.impact_dv_max ** 2)
         self.foot_vz_prev.copy_(vz)
         if self.substeps == self.cfg.decimation - self.accel_avg_steps:
@@ -649,13 +653,16 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
                     q[switch], qd[switch] = wq, wqd
             q = torch.clamp(q, self._joint_pos_lower[env_ids], self._joint_pos_upper[env_ids])
             self.robot.write_root_link_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
-            self.robot.write_root_com_velocity_to_sim_index(root_velocity=vel, env_ids=env_ids)
+            self.robot.write_root_link_velocity_to_sim_index(root_velocity=vel, env_ids=env_ids)  # ref v = link origin
             self.robot.write_joint_position_to_sim_index(position=q, env_ids=env_ids)
             self.robot.write_joint_velocity_to_sim_index(velocity=qd, env_ids=env_ids)
             if self.cfg.actuator_model and hasattr(self, "actuator_buffer"):
                 self.actuator_buffer[:, env_ids] = q.unsqueeze(0)
-            self.q_target[env_ids] = q
-            dq = q - self.default_q[env_ids]
+            # targets / actions live in the encoder frame (_apply_action sends q_target - joint_obs_offset): the spawned
+            # pose there is q + offset, so the first targets hold it instead of stepping by the zero error
+            q_enc = q + self.joint_obs_offset[env_ids] if hasattr(self, "joint_obs_offset") else q
+            self.q_target[env_ids] = q_enc
+            dq = q_enc - self.default_q[env_ids]
             scale = torch.where(dq >= 0.0, self.action_positive_scale, self.action_negative_scale)
             act = torch.clamp(dq / scale, -1.0, 1.0)
             self.actions[env_ids] = act
@@ -675,5 +682,6 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         self.q_des_prev[env_ids] = self.q_target[env_ids]
         self.q_filt[env_ids] = self.q_target[env_ids]
         self.foot_vz_prev[env_ids] = 0.0
+        self.impact_skip[env_ids] = True  # first physics step after a reset: no previous foot velocity
         self.impact_acc[env_ids] = 0.0
         self.tau_sq_acc[env_ids] = 0.0

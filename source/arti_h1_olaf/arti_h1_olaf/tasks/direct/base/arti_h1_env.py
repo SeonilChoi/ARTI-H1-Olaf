@@ -505,7 +505,8 @@ class ArtiH1AmpEnv(DirectRLEnv):
         return body_position + offset_w
 
     def _get_offset_body_linear_velocity(self, body_index: int, offset: torch.Tensor, has_offset: bool) -> torch.Tensor:
-        body_velocity = self.robot.data.body_lin_vel_w.torch[:, body_index]
+        # the offset is from the link origin: start from the link-origin velocity (body_lin_vel_w is the centre of mass)
+        body_velocity = self.robot.data.body_link_lin_vel_w.torch[:, body_index]
         if not has_offset:
             return body_velocity
 
