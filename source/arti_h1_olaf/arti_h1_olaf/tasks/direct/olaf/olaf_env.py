@@ -105,6 +105,9 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         self.ref_quat[:, 3] = 1.0
         self.ref_v = torch.zeros(n, 3, device=dev)
         self.ref_w = torch.zeros(n, 3, device=dev)
+        # standing: previous reference torso pose, for the reference torso velocity while g (or the path frame) moves
+        self.ref_pos_prev = self.ref_pos.clone()
+        self.ref_quat_prev = self.ref_quat.clone()
 
         # thermal model (eq. 6), per joint type
         self.th_alpha = torch.tensor([cfg.thermal_alpha[t] for t in jtype], device=dev)[None]
@@ -239,8 +242,14 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
             contact = torch.ones(q.shape[0], 2, device=self.device)
             pos = torch.cat((path[:, :2] + _rot2(psi, p[:, :2]), (p[:, 2] + z0)[:, None]), dim=-1)
             quat = quat_mul(_yaw_quat(psi), rq)
-            v = torch.zeros_like(pos)
-            w = torch.zeros_like(pos)
+            if env_ids is None:
+                # the reference moves while g follows its target (and the path frame converges): torso velocity of that
+                # motion (world), finite difference over the control step like qd
+                v = (pos - self.ref_pos_prev) / self.step_dt
+                w = quat_box_minus(quat, self.ref_quat_prev) / self.step_dt
+            else:
+                v = torch.zeros_like(pos)
+                w = torch.zeros_like(pos)
         self.ref_q[ids], self.ref_qd[ids], self.ref_contact[ids] = q, qd, contact
         self.ref_pos[ids], self.ref_quat[ids], self.ref_v[ids], self.ref_w[ids] = pos, quat, v, w
 
@@ -311,6 +320,8 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         else:
             step = self.stand_rate * dt
             self.ref_q_prev.copy_(self.ref_q)
+            self.ref_pos_prev.copy_(self.ref_pos)
+            self.ref_quat_prev.copy_(self.ref_quat)
             self.g += torch.clamp(self.g_target - self.g, -step, step)
             mid, psi_f = self._feet_frame()
         self._step_path(self.path, pos[:, :2], _yaw_of(quat), mid, psi_f)
@@ -651,6 +662,8 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
             self.previous_actions[env_ids] = act
             self.previous_actions2[env_ids] = act
         self.ref_q_prev[env_ids] = self.ref_q[env_ids]
+        self.ref_pos_prev[env_ids] = self.ref_pos[env_ids]
+        self.ref_quat_prev[env_ids] = self.ref_quat[env_ids]
         self.est_init[env_ids] = False
         lo, hi = cfg.accel_bias_range
         self.accel_bias[env_ids] = torch.empty(k, 3, device=dev).uniform_(lo, hi)
