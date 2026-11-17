@@ -52,6 +52,48 @@ python scripts/skrl/train.py --task Arti-H1-Olaf-Stand-v0 physics=isaacsim_physx
 python scripts/check_reference.py --task Arti-H1-Olaf-Walk-Play-v0 --no_dr --headless
 ```
 
+## Server (Isaac Sim PhysX, tmux)
+
+Same layout as the local machine: Isaac Lab venv at `/opt/isaac/IsaacLab-main/.venv`, projects under `/opt/isaac/projects`.
+The reference table (`assets/reference/olaf_kb_reference.npz`) and the thermal parameters are committed, so the
+server needs neither PlaCo nor the real logs.
+
+```bash
+# once
+cd /opt/isaac/projects
+git clone https://github.com/SeonilChoi/ARTI-H1_Olaf.git arti_h1_olaf
+source /opt/isaac/IsaacLab-main/.venv/bin/activate
+cd arti_h1_olaf
+uv pip install --no-deps -e source/arti_h1_olaf   # or: python -m pip install --no-deps -e source/arti_h1_olaf
+
+# every terminal
+source /opt/isaac/IsaacLab-main/.venv/bin/activate
+cd /opt/isaac/projects/arti_h1_olaf && git pull
+export OMNI_KIT_ACCEPT_EULA=yes
+
+# walking policy (paper: 8192 envs, 100k iterations = 2.4M skrl timesteps)
+tmux new -s olaf-walk
+python scripts/skrl/train.py --task Arti-H1-Olaf-Walk-v0 physics=isaacsim_physx --num_envs 8192 \
+    agent.agent.experiment.directory=olaf_walk
+# standing policy (second terminal)
+tmux new -s olaf-stand
+python scripts/skrl/train.py --task Arti-H1-Olaf-Stand-v0 physics=isaacsim_physx --num_envs 8192 \
+    agent.agent.experiment.directory=olaf_stand
+# resume: add --checkpoint logs/skrl/olaf_walk/<run>/checkpoints/agent_N.pt
+```
+
+Runs land in `logs/skrl/olaf_walk|olaf_stand/<date>_ppo_torch/` (checkpoint every 1000 iterations). TensorBoard:
+`tensorboard --logdir logs/skrl --port 6006`. Watch `Olaf/joint_err_deg`, `Olaf/torso_ori_err_deg`,
+`Olaf/torso_pos_err_cm`, `Olaf/contact_match`, `Olaf/temp_over_max_frac`, `Episode / Total timesteps (mean)` (max 1199
+= no falls in a 20 s episode) and the `Reward/<term>` scalars.
+
+Video of a checkpoint (headless is the default, mp4 in `<run>/videos/play/`):
+
+```bash
+python scripts/skrl/play.py --task Arti-H1-Olaf-Walk-Play-v0 --checkpoint <run>/checkpoints/agent_N.pt \
+    --num_envs 4 --video --video_length 600 physics=isaacsim_physx
+```
+
 ## Deployment notes (not done yet)
 
 The policy needs inputs that `humanoid_controller` does not produce today:
