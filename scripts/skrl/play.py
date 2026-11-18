@@ -111,6 +111,55 @@ VELOCITY_PLAY_PUSH_SCHEDULE = (
 )
 
 
+# Arti-H1-Olaf-*: the control input g (walk: vx m/s, vy m/s, wz rad/s; stand: dz m, roll, pitch, yaw rad) inside the
+# training ranges (olaf_env_cfg walk / stand command ranges). The policy observes g itself (the last obs entries), so g
+# is set in the env (walk: projected onto the reference coverage like the env samples it) and the obs is left alone.
+OLAF_WALK_SEQUENCE = (
+    ("forward", (0.12, 0.0, 0.0)),
+    ("stop", (0.0, 0.0, 0.0)),
+    ("side_left", (0.0, 0.05, 0.0)),
+    ("backward", (-0.10, 0.0, 0.0)),
+    ("turn_left", (0.0, 0.0, 0.30)),
+    ("forward_turn_right", (0.10, 0.0, -0.25)),
+    ("stop", (0.0, 0.0, 0.0)),
+)
+OLAF_STAND_SEQUENCE = (
+    ("nominal", (0.0, 0.0, 0.0, 0.0)),
+    ("crouch", (-0.03, 0.0, 0.0, 0.0)),
+    ("high", (0.015, 0.0, 0.0, 0.0)),
+    ("roll", (0.0, 0.08, 0.0, 0.0)),
+    ("pitch", (0.0, 0.0, 0.12, 0.0)),
+    ("yaw", (0.0, 0.0, 0.0, 0.25)),
+    ("nominal", (0.0, 0.0, 0.0, 0.0)),
+)
+# pushes at about half the final training push range (x +-0.5, y +-0.3 m/s)
+OLAF_PUSH_SCHEDULE = (
+    (2.5, 0.25, 0.0, 0.0),
+    (12.5, 0.0, -0.15, 0.0),
+    (22.5, -0.20, 0.0, 0.0),
+    (32.5, 0.0, 0.15, 0.0),
+)
+
+
+def _apply_olaf_sequence(env):
+    seq = OLAF_WALK_SEQUENCE if env.walk else OLAF_STAND_SEQUENCE
+    t = env.episode_length_buf.float() * env.step_dt
+    ids = torch.clamp((t / PLAY_COMMAND_DURATION_S).long(), max=len(seq) - 1)
+    g = torch.tensor([c for _, c in seq], device=env.device, dtype=torch.float32).index_select(0, ids)
+    env.command_timer[:] = 1.0e9
+    if env.walk:
+        idx, w = env._walk_blend(g)
+        env.g[:] = (w[..., None] * env.walk_keys[idx]).sum(1)
+        env.commands[:] = env.g
+    else:
+        env.g_target[:] = g
+    cur = int(ids[0].item())
+    if getattr(env, "_last_play_command_id", None) != cur:
+        env._last_play_command_id = cur
+        print(f"[INFO] t={float(t[0]):.1f} s g: {seq[cur][0]} {seq[cur][1]} (walk g after projection: "
+              f"{[round(x, 3) for x in env.g[0].tolist()]})" if env.walk else f"[INFO] t={float(t[0]):.1f} s g: {seq[cur][0]} {seq[cur][1]}", flush=True)
+
+
 def _apply_play_pushes(env, scale: float):
     """Add the scheduled velocity kick to every env's root when env 0's episode time crosses a push time."""
     t = float(env.episode_length_buf[0].item()) * env.step_dt
@@ -174,6 +223,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--camera_follow", action="store_true", default=False, help="Move the video camera with the robot.")
     parser.add_argument("--camera", choices=("side", "front"), default="side", help="Video camera: side or front (velocity task).")
     parser.add_argument("--zero_action", action="store_true", default=False, help="Send zero actions (PD hold of the default pose) with a zero command; shows the standing pose.")
+    parser.add_argument("--dr_step", type=int, default=-1, help="Olaf: play at the training DR level of this step (default: the final DR of the Play cfg).")
     parser.add_argument("--push_scale", type=float, default=1.0, help="Scale of the scheduled play pushes.")
     cli_args_skrl.add_skrl_args(parser)
     add_launcher_args(parser)
@@ -201,6 +251,7 @@ def _resolve_checkpoint(args_cli, log_root_path: str, algorithm: str, metadata: 
 
 
 def main(argv: list[str] | None = None) -> None:
+    global PLAY_COMMAND_SEQUENCE, PLAY_PUSH_SCHEDULE
     args_cli = _parse_args(sys.argv[1:] if argv is None else argv)
     check_skrl_version()
     agent_cfg_entry_point = resolve_skrl_agent_cfg_entry_point(args_cli.agent, args_cli.algorithm)
@@ -208,8 +259,16 @@ def main(argv: list[str] | None = None) -> None:
     env_cfg, agent_cfg = resolve_task_config(args_cli.task, agent_cfg_entry_point, play_mode=False)
     algorithm = resolve_skrl_algorithm(agent_cfg, args_cli.algorithm)
 
+    olaf = "Olaf" in args_cli.task
+    if olaf:
+        PLAY_COMMAND_SEQUENCE = OLAF_WALK_SEQUENCE if "Walk" in args_cli.task else OLAF_STAND_SEQUENCE
+        PLAY_PUSH_SCHEDULE = OLAF_PUSH_SCHEDULE
+        env_cfg.reset_yaw_range = (0.0, 0.0)  # face +x for the side camera
+        if args_cli.dr_step >= 0:
+            env_cfg.dr_widen_steps = (24_000, 1_200_000)
+            env_cfg.actuator_delay_extra_curriculum_steps = (24_000, 1_200_000)
+            env_cfg.curriculum_step_offset = args_cli.dr_step
     if "Velocity" in args_cli.task:
-        global PLAY_COMMAND_SEQUENCE, PLAY_PUSH_SCHEDULE
         PLAY_COMMAND_SEQUENCE, PLAY_PUSH_SCHEDULE = VELOCITY_PLAY_COMMAND_SEQUENCE, VELOCITY_PLAY_PUSH_SCHEDULE
         # the velocity task resets with a random yaw; face +x so the commands read the same in the side-view video
         if hasattr(env_cfg, "reset_yaw_range"):
@@ -226,7 +285,7 @@ def main(argv: list[str] | None = None) -> None:
         env_cfg.viewer.origin_type = "env"
         env_cfg.viewer.env_index = 0
         env_cfg.viewer.asset_name = None
-        velocity = "Velocity" in args_cli.task
+        velocity = "Velocity" in args_cli.task or olaf
         if velocity:
             # the velocity task walks ~1 m per segment: follow the robot root from the side, closer than the default
             env_cfg.viewer.origin_type = "asset_root"
@@ -240,6 +299,9 @@ def main(argv: list[str] | None = None) -> None:
         else:
             env_cfg.viewer.eye = (0.0, -1.6, 0.55) if velocity else VIDEO_CAMERA_EYE
             env_cfg.viewer.lookat = (0.0, 0.0, 0.15) if velocity else VIDEO_CAMERA_LOOKAT
+            if olaf:  # follow from the side, close (the KB robot is ~0.6 m tall)
+                env_cfg.viewer.eye = (0.0, -1.0, 0.45)
+                env_cfg.viewer.lookat = (0.0, 0.0, 0.28)
         env_cfg.viewer.resolution = (args_cli.video_width, args_cli.video_height)
     pre_launch_video_config(env_cfg, args_cli)
 
@@ -278,7 +340,10 @@ def main(argv: list[str] | None = None) -> None:
         runner.agent.enable_training_mode(False, apply_to_models=True)
 
         obs, _ = env.reset()
-        obs = _apply_play_command_sequence(command_env, obs)
+        if olaf:
+            _apply_olaf_sequence(command_env)
+        else:
+            obs = _apply_play_command_sequence(command_env, obs)
         states = env.state()
 
         def step() -> None:
@@ -287,8 +352,13 @@ def main(argv: list[str] | None = None) -> None:
             actions = outputs[-1].get("mean_actions", outputs[0])
             if args_cli.zero_action:
                 actions = torch.zeros_like(actions)
-            obs, _, _, _, _ = env.step(actions)
-            obs = _apply_play_command_sequence(command_env, obs)
+            obs, _, terminated, _, _ = env.step(actions)
+            if bool(terminated.flatten()[0]):
+                print(f"[INFO] env 0 fell (episode restarts) at sim step {command_env.common_step_counter}", flush=True)
+            if olaf:
+                _apply_olaf_sequence(command_env)
+            else:
+                obs = _apply_play_command_sequence(command_env, obs)
             if not args_cli.no_push:
                 _apply_play_pushes(command_env, args_cli.push_scale)
             states = env.state()
@@ -299,7 +369,7 @@ def main(argv: list[str] | None = None) -> None:
                 command_env.sim.set_camera_view([root[0] + eye[0], root[1] + eye[1], eye[2]], [root[0] + look[0], root[1] + look[1], look[2]])
 
         follow = None
-        if args_cli.video and "Velocity" in args_cli.task and args_cli.camera_follow:
+        if args_cli.video and ("Velocity" in args_cli.task or olaf) and (args_cli.camera_follow or olaf):
             follow = (tuple(env_cfg.viewer.eye), tuple(env_cfg.viewer.lookat))
         run_playback(step, dt=dt, args_cli=args_cli, env_cfg=env_cfg)
 
