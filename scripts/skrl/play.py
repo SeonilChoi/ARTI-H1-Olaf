@@ -21,6 +21,7 @@ push event off, and a 40 s episode.
 import argparse
 import contextlib
 import logging
+import math
 import os
 import sys
 
@@ -172,7 +173,28 @@ def _apply_play_pushes(env, scale: float):
             vel[:, 1] += scale * vy
             vel[:, 5] += scale * wz
             env.robot.write_root_velocity_to_sim_index(root_velocity=vel)
+            env._push_arrow = (scale * vx, scale * vy, t + PUSH_ARROW_SHOW_S)
             print(f"[INFO] push at t={t:.2f} s: dvx {scale * vx:+.2f} dvy {scale * vy:+.2f} m/s, dwz {scale * wz:+.2f} rad/s", flush=True)
+
+
+PUSH_ARROW_SHOW_S = 1.0     # the push arrow stays on screen this long after the kick
+PUSH_ARROW_M_PER_MPS = 1.2  # arrow length per m/s of the velocity kick
+
+
+def _log_push_frame(env, cam):
+    """One row per policy step (= one video frame): env 0 pelvis, the camera eye / lookat and the active push, for
+    scripts/overlay_push_arrows.py (markers / late USD prims are not rendered in a headless video run)."""
+    if not hasattr(env, "_push_rows"):
+        env._push_rows = []
+    arrow = getattr(env, "_push_arrow", None)
+    t = float(env.episode_length_buf[0].item()) * env.step_dt
+    on = arrow is not None and arrow[2] - PUSH_ARROW_SHOW_S - 1e-6 <= t <= arrow[2]
+    # the pelvis link origin sits near the soles; the kick moves the pelvis body, so aim at its centre of mass
+    p = env.robot.data.root_com_pos_w.torch[0].tolist()
+    eye, look = cam
+    qx, qy, qz, qw = env.robot.data.root_quat_w.torch[0].tolist()   # xyzw (Isaac Lab 3.x)
+    yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    env._push_rows.append((t, *p, *eye, *look, arrow[0] if on else 0.0, arrow[1] if on else 0.0, yaw))
 
 
 def _overwrite_observation_commands(obs, command_obs: torch.Tensor):
@@ -366,12 +388,24 @@ def main(argv: list[str] | None = None) -> None:
                 # asset_root viewer tracking does not move the recording camera in 3.x: follow the root by hand
                 root = command_env.robot.data.root_pos_w.torch[0].tolist()
                 eye, look = follow
-                command_env.sim.set_camera_view([root[0] + eye[0], root[1] + eye[1], eye[2]], [root[0] + look[0], root[1] + look[1], look[2]])
+                cam = ([root[0] + eye[0], root[1] + eye[1], eye[2]], [root[0] + look[0], root[1] + look[1], look[2]])
+                command_env.sim.set_camera_view(*cam)
+                if olaf:
+                    _log_push_frame(command_env, cam)
 
         follow = None
         if args_cli.video and ("Velocity" in args_cli.task or olaf) and (args_cli.camera_follow or olaf):
             follow = (tuple(env_cfg.viewer.eye), tuple(env_cfg.viewer.lookat))
         run_playback(step, dt=dt, args_cli=args_cli, env_cfg=env_cfg)
+        rows = getattr(command_env, "_push_rows", None)
+        if rows:
+            import csv
+            path = os.path.join(log_dir, "videos", "play", "push_frames.csv")
+            with open(path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["t", "px", "py", "pz", "ex", "ey", "ez", "lx", "ly", "lz", "push_vx", "push_vy", "yaw"])
+                w.writerows(rows)
+            print(f"[INFO] push / camera log: {path} (draw with scripts/overlay_push_arrows.py)", flush=True)
 
 
 if __name__ == "__main__":
