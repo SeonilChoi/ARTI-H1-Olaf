@@ -11,6 +11,7 @@ ARTI_H1_POLICY_JOINT_NAMES order (_joints_to_policy), as in the deployed ARTI-H1
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Sequence
 
 import numpy as np
@@ -89,6 +90,21 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         srng = torch.tensor(cfg.stand_command_range, device=dev, dtype=torch.float32)
         self.stand_lo, self.stand_hi = srng[:, 0], srng[:, 1]
         self.stand_rate = torch.tensor(cfg.stand_command_rate, device=dev, dtype=torch.float32)
+        self.switch_bank = None
+        if not self.walk and cfg.switch_bank_file:
+            f = cfg.switch_bank_file
+            if not os.path.dirname(f):
+                f = os.path.join(os.path.dirname(cfg.reference_file), f)
+            b = np.load(f)
+            jn = [str(x) for x in b["joint_names"]] if "joint_names" in b else names
+            jp = torch.tensor([jn.index(nm) for nm in names], device=dev)
+            pose = torch.tensor(b["pose"], device=dev, dtype=torch.float32)
+            pose[:, :2] = 0.0  # torso over the env origin (the walk drifted it), the path frame follows it
+            self.switch_bank = {
+                "pose": pose, "vel": torch.tensor(b["vel"], device=dev, dtype=torch.float32),
+                "q": torch.tensor(b["q"], device=dev, dtype=torch.float32)[:, jp],
+                "qd": torch.tensor(b["qd"], device=dev, dtype=torch.float32)[:, jp]}
+            print(f"[olaf] switch bank {f}: {len(pose)} walk -> stand states")
 
         # ---------------- state ----------------
         gdim = 3 if self.walk else 4
@@ -625,6 +641,13 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
             self.phase[env_ids[switch]] = cfg.walk_start_phase
         else:
             self.g[env_ids] = self.g_target[env_ids] if cfg.reset_reference_state else 0.0
+            if self.switch_bank is not None:
+                self.g[env_ids[switch]] = 0.0  # the controller switches with the STAND input at 0, g_target ramps in
+        bank_rows = None
+        if not self.walk and self.switch_bank is not None and switch.any():
+            bank_rows = torch.randint(0, len(self.switch_bank["pose"]), (int(switch.sum()),), device=dev)
+            # controller olaf_reset_path: path frame at the torso (origin + bank xy 0, the bank torso heading)
+            self.path[env_ids[switch], 2] = _yaw_of(self.switch_bank["pose"][bank_rows, 3:7])
         self._compute_reference(env_ids)
         if cfg.reset_reference_state:
             # reference state initialisation: torso pose / velocity and joints of x_t
@@ -644,6 +667,14 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
                     vel[switch] = 0.0
                     q[switch] = self.default_q[s_ids]
                     qd[switch] = 0.0
+                elif bank_rows is not None:
+                    # the walking policy's own state at the controller's switch (touchdown after the stop request)
+                    B = self.switch_bank
+                    bp = B["pose"][bank_rows].clone()
+                    bp[:, :3] += self.scene.env_origins[s_ids]
+                    pose[switch] = bp
+                    vel[switch] = B["vel"][bank_rows]
+                    q[switch], qd[switch] = B["q"][bank_rows], B["qd"][bank_rows]
                 else:
                     # mid-stride walking reference state (random phase, random walking input)
                     gw = self.walk_lo + torch.rand(len(s_ids), 3, device=dev) * (self.walk_hi - self.walk_lo)

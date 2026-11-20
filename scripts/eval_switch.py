@@ -16,6 +16,11 @@ Two Isaac Sim processes (one env type each), run by this script:
   python scripts/eval_switch.py --walk_ckpt <walk agent.pt> --stand_ckpt <stand agent.pt> [--num_envs 256]
       [--switch touchdown|immediate] [--history pose|walk] [--speed 1.0] [--push] [--out <dir>]
 
+Switch-state bank for the stand training (env.switch_bank_file, stage 2): walk stage only, per-env command scale
+uniform in [0, --speed], the states written to --bank (a bare file name goes to assets/reference):
+
+  python scripts/eval_switch.py --walk_ckpt <walk agent.pt> --stand_ckpt - --num_envs 4096 --bank olaf_switch_bank.npz
+
 Each checkpoint is read with <run>/params (the run's training cfg is not used: the Play task cfg is). Both stages use
 the final domain randomisation of the Play tasks; the DR draws of the two stages are independent.
 """
@@ -41,17 +46,19 @@ ap.add_argument("--push", action="store_true", help="keep the Play tasks' random
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--out", default="logs/eval_switch")
 ap.add_argument("--stage", choices=("all", "walk", "stand"), default="all")
+ap.add_argument("--bank", default=None, help="write the switch states as a stand-training bank (walk stage only)")
 args, rest = ap.parse_known_args()
 
 if args.stage == "all":
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     base = [sys.executable, __file__] + [a for a in sys.argv[1:]]
-    for stage in ("walk", "stand"):
+    for stage in (("walk",) if args.bank else ("walk", "stand")):
         r = subprocess.run(base + ["--stage", stage], check=False)
         if r.returncode != 0:
             sys.exit(f"[eval_switch] {stage} stage failed ({r.returncode})")
-    print((out / "result.txt").read_text())
+    if not args.bank:
+        print((out / "result.txt").read_text())
     sys.exit(0)
 
 from isaaclab.app import AppLauncher  # noqa: E402
@@ -126,7 +133,8 @@ def walk_stage():
     pi = load_policy(args.walk_ckpt, dev)
     gen = torch.Generator(device=dev).manual_seed(args.seed)
     g = u.walk_lo + torch.rand(n, 3, device=dev, generator=gen) * (u.walk_hi - u.walk_lo)
-    idx, w = u._walk_blend(g * args.speed)
+    scale = torch.rand(n, 1, device=dev, generator=gen) * args.speed if args.bank else args.speed
+    idx, w = u._walk_blend(g * scale)
     g_walk = (w[..., None] * u.walk_keys[idx]).sum(1)
     idx, w = u._walk_blend(torch.zeros(n, 3, device=dev))
     g_zero = (w[..., None] * u.walk_keys[idx]).sum(1)
@@ -185,6 +193,12 @@ def walk_stage():
         stats["wait_s_mean"] = float(ws.mean())
         stats["tilt_at_switch_mean"] = float(np.mean([snap_t[e]["tilt"] for e in keys]))
     (OUT / "walk_stage.json").write_text(json.dumps(stats, indent=1))
+    if args.bank and keys:
+        from arti_h1_olaf.tasks.direct.olaf.olaf_env_cfg import REFERENCE_FILE
+        bank = Path(args.bank) if os.path.dirname(args.bank) else Path(REFERENCE_FILE).parent / args.bank
+        np.savez(bank, joint_names=np.array(list(u.robot.data.joint_names)), walk_ckpt=str(args.walk_ckpt),
+                 **{k: np.stack([snap_t[e][k] for e in keys]) for k in ("pose", "vel", "q", "qd", "tilt", "wait_s")})
+        print(f"[eval_switch] bank {bank}: {len(keys)} states")
     print("[eval_switch] walk stage", stats)
     env.close()
 

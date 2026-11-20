@@ -207,6 +207,11 @@ class ArtiH1OlafEnvCfg(ArtiH1VelocityKBEnvCfg):
     reset_stand_pose_fraction = 0.2
     reset_walk_pose_fraction = 0.3
     walk_start_phase = 0.92
+    # walk -> stand switch states of the walking policy itself (scripts/eval_switch.py --bank): when set, the standing
+    # episodes of reset_walk_pose_fraction start from a random row (root pose / velocity, joints at the touchdown the
+    # controller switches on) instead of a walking reference state; g = 0 and the action history = the pose, like
+    # ArtiH1::olaf_switch_reset. A file name without a directory is looked up in assets/reference.
+    switch_bank_file: str | None = None
 
     # --- terminations (Sec. V-C): torso / upper body on the ground -> inherited trunk-height + tilt check ---
 
