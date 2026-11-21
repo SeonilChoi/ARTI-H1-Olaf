@@ -227,9 +227,11 @@ class ArtiH1OlafEnvCfg(ArtiH1VelocityKBEnvCfg):
     imu_gyro_extra_delay_steps = 1
     joint_obs_offset_range_by_type = {"hip_yaw": 0.03, "hip_roll": 0.06, "hip_pitch": 0.08, "knee": 0.08,
                                       "ankle_pitch": 0.20, "ankle_roll": 0.06}
-    actuator_delay_ms = {"hip_yaw": 4.0, "hip_roll": 4.0, "hip_pitch": 4.0, "knee": 4.0, "ankle_pitch": 3.0, "ankle_roll": 3.0}
+    # real Olaf walk logs 11-21 (walk_replay.py): the robot tracks the policy target 1.3-1.8x worse than sim with 0.6-0.9x
+    # the torque -> +15 ms delay and kp x0.8-0.9 (dr_start_kp) reproduce the tracking error / torque of every joint type
+    actuator_delay_ms = {"hip_yaw": 19.0, "hip_roll": 19.0, "hip_pitch": 19.0, "knee": 19.0, "ankle_pitch": 18.0, "ankle_roll": 18.0}
     actuator_delay_jitter_ms = (-6.0, 6.0)
-    actuator_delay_extra_ms = {"hip_roll": 25.0, "ankle_pitch": 12.0}
+    actuator_delay_extra_ms = {"hip_roll": 10.0, "ankle_pitch": 8.0}  # was 25 / 12 on the 4 ms base: final-DR error 1.2-1.5x real
     # --- domain randomisation grows gradually (base env DR widening): from the dr_start_* ranges (near the measured
     # robot) to the final ranges above, in dr_widen_levels steps between dr_widen_steps (env steps; 24 per iteration:
     # iteration 1k -> 50k of 100k). Covers friction, pelvis mass / CoM, PD gains, pushes, actuator delay jitter, Coulomb,
@@ -244,12 +246,19 @@ class ArtiH1OlafEnvCfg(ArtiH1VelocityKBEnvCfg):
     actuator_coulomb_scale_range = (0.3, 1.2)
     actuator_armature_scale_range = (0.5, 1.3)
     yaw_torque_bias_range = (-0.8, 0.8)
+    dr_start_kp = (0.8, 0.95)
+    # unmodelled torso vibration (real Olaf walk logs 11-21, scripts/real2sim/walk_replay.py): the real gyro has 2-3x the
+    # sim power at 3-12 Hz (roll / pitch rate) and 0-6 Hz (yaw rate) that no actuator delay / gain / friction change
+    # reproduces. Band-limited random torque on the pelvis (body frame, Nm std per axis, band per axis), per-episode scale.
+    torso_torque_noise_std = (2.0, 2.5, 2.0)  # matches the real gyro std per axis (in place / forward / turn)
+    torso_torque_noise_band_hz = ((3.0, 12.0), (3.0, 12.0), (0.5, 5.0))
+    torso_torque_noise_scale_range = (0.5, 1.75)
 
     def __post_init__(self):
         super().__post_init__()
         self.sim.dt = 1.0 / 600.0
         self.sim.render_interval = self.decimation
-        self.events.actuator_gains.params["stiffness_distribution_params"] = (0.85, 1.3)
+        self.events.actuator_gains.params["stiffness_distribution_params"] = (0.7, 1.2)
         self.events.actuator_gains.params["damping_distribution_params"] = (0.5, 1.2)
         self.events.push_robot.params["velocity_range"]["x"] = (-0.5, 0.5)
         self.events.push_robot.params["velocity_range"]["y"] = (-0.3, 0.3)

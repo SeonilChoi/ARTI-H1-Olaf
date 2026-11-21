@@ -141,6 +141,28 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         # per physics step accumulators: squared torque (thermal model, torque reward), foot vertical velocity change
         self.effort = torch.tensor([JOINT_EFFORT_LIMIT[nm] for nm in names], device=dev)[None]
         self.tau_sq_acc = torch.zeros(n, 12, device=dev)
+        # band-limited torso torque noise (cfg.torso_torque_noise_*): difference of two first-order low-passes of white
+        # noise, normalised to unit std at the physics rate
+        self.tt_lo = torch.zeros(n, 3, device=dev)
+        self.tt_hi = torch.zeros(n, 3, device=dev)
+        self.tt_scale = torch.ones(n, 1, device=dev)
+        pdt = cfg.sim.dt
+        a_lo, a_hi, norm = [], [], []
+        g = torch.Generator().manual_seed(0)
+        w = torch.randn(200_000, generator=g).tolist()
+        for f_lo, f_hi in cfg.torso_torque_noise_band_hz:
+            al, ah = 1.0 - math.exp(-2 * math.pi * f_lo * pdt), 1.0 - math.exp(-2 * math.pi * f_hi * pdt)
+            lo = hi = 0.0
+            out = []
+            for x in w:  # one-off filter gain on the CPU
+                lo += al * (x - lo)
+                hi += ah * (x - hi)
+                out.append(hi - lo)
+            a_lo.append(al); a_hi.append(ah); norm.append(1.0 / float(np.std(out[2000:])))
+        self.tt_a_lo = torch.tensor(a_lo, device=dev)
+        self.tt_a_hi = torch.tensor(a_hi, device=dev)
+        self.tt_norm = torch.tensor(norm, device=dev)
+        self.tt_std = torch.tensor(cfg.torso_torque_noise_std, device=dev, dtype=torch.float32)
         self.substeps = 0
         self.foot_vz_prev = torch.zeros(n, 2, device=dev)
         self.impact_skip = torch.ones(n, dtype=torch.bool, device=dev)
@@ -372,6 +394,7 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         self.robot.actuators.target_command.set_position_index(value=target)
         self._apply_balance_support()
         self._apply_yaw_torque_bias()
+        self._apply_torso_torque_noise()
         # PD torque the motor produces this physics step (implicit actuator: same law, clamped at the effort limit)
         d = self.robot.data
         tau = d.joint_stiffness.torch * (target - d.joint_pos.torch) - d.joint_damping.torch * d.joint_vel.torch
@@ -613,6 +636,16 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
         return {"policy": policy, "critic": critic}
 
     # ------------------------------------------------------------------ reset
+    def _apply_torso_torque_noise(self):
+        if not bool((self.tt_std > 0).any()):
+            return
+        w = torch.randn_like(self.tt_lo)
+        self.tt_lo += self.tt_a_lo * (w - self.tt_lo)
+        self.tt_hi += self.tt_a_hi * (w - self.tt_hi)
+        torque = ((self.tt_hi - self.tt_lo) * (self.tt_norm * self.tt_std) * self.tt_scale)[:, None, :]
+        self.robot.instantaneous_wrench_composer.add_forces_and_torques_index(
+            forces=torch.zeros_like(torque), torques=torque, body_ids=self._support_body_ids, is_global=False)
+
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
@@ -622,6 +655,10 @@ class ArtiH1OlafEnv(ArtiH1VelocityEnv):
             return
         k, dev, cfg = len(env_ids), self.device, self.cfg
         d = self.robot.data
+        lo, hi = cfg.torso_torque_noise_scale_range
+        self.tt_scale[env_ids] = torch.empty(k, 1, device=dev).uniform_(lo, hi)
+        self.tt_lo[env_ids] = 0.0
+        self.tt_hi[env_ids] = 0.0
         # thermal state: ambient per episode, initial temperatures up to above T_max (paper: train near the limit)
         lo, hi = cfg.thermal_ambient_range
         self.temp_amb[env_ids] = torch.empty(k, 1, device=dev).uniform_(lo, hi)
